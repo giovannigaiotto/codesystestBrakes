@@ -2,765 +2,773 @@
    TestBremse_Controls   (PROGRAM / PRG)
    CODESYS 3.5.18.4 - Structured Text
 
-   Zweck
+   SCOPO
    -----
-   Bediengefuehrte und verriegelte Bedienung der beiden Windenbremsen im
-   Service-Mode:
-     1) Lueftspaltkontrolle  -> eine Bremse oeffnen, die andere haelt die Winde
-     2) Bremstest            -> Moment gegen die geschlossene Bremse aufbauen
-                                und auf Schlupf ueberwachen
+   Gestione guidata e interbloccata dei due freni della winda in Service Mode:
+     1) Controllo lueftspalt (traferro) -> si apre UN solo freno, l'altro tiene
+     2) Bremstest (prova freni)         -> coppia rampata contro il freno chiuso
+                                           con sorveglianza dello slittamento
 
-   Grundregeln (Vorgabe Projektleitung)
-   ------------------------------------
-   * Nur im Service-Mode (Schluesselschalter) und ab Userlevel 2 bedienbar
-   * Not-Aus bleibt jederzeit aktiv und ist Freigabebedingung
-   * Es darf immer nur EINE Bremse offen sein
-   * Eine geoeffnete Bremse muss MANUELL wieder geschlossen werden,
-     bevor die andere Bremse geoeffnet werden kann (Verriegelung iBremseOffenLatch)
-   * Drehzahl und Moment werden dauernd ueberwacht; bei Bewegung bzw.
-     unzulaessigem Moment werden Sollwerte gesperrt und die Bremsen geschlossen
+   Sigle dei freni (mantenute come nell'impianto):
+     SB = Standbremse    = freno di stazionamento
+     BB = Betriebsbremse = freno di servizio
 
-   ACHTUNG - SICHERHEITSTECHNIK
-   ----------------------------
-   Diese Schrittkette ist die FUNKTIONALE Verriegelung in der Standard-SPS.
-   Die sicherheitsgerichtete Verriegelung (nur eine Bremse offen, Not-Aus,
-   Stillstands-/Drehzahlwaechter, sichere Momentbegrenzung) muss in der
-   Pilz-Sicherheitssteuerung realisiert und dort auch bewertet werden.
-   Diese SPS darf keine Sicherheitsfunktion ueberbruecken.
+   REGOLE BASE (richiesta della direzione tecnica)
+   -----------------------------------------------
+   * Utilizzabile solo in Service Mode (chiave fisica) e da livello utente 2
+   * Il Notaus resta sempre attivo ed e' condizione di consenso
+   * Puo' essere aperto un solo freno per volta
+   * Il freno aperto va richiuso MANUALMENTE prima di poter aprire l'altro
+     (interblocco iBrakeOpenLatch)
+   * Giri e coppia sono sorvegliati in permanenza: in caso di movimento o di
+     coppia non ammessa i setpoint vengono azzerati e i freni si chiudono
 
-   Einbindung
-   ----------
-   * PRG in der Task NACH der normalen Windensteuerung aufrufen, damit die hier
-     erzwungenen Sollwerte (0 / begrenzt) die letzten Schreibzugriffe sind.
-   * Der alte Code-Block
+   ATTENZIONE - SICUREZZA
+   ----------------------
+   Questa sequenza e' l'interblocco FUNZIONALE nel PLC standard.
+   L'interblocco di sicurezza vero (un solo freno aperto, Notaus, sorveglianza
+   di fermo macchina e dei giri, limitazione sicura della coppia) va realizzato
+   e valutato nella sicurezza Pilz.
+   Questo PLC non deve bypassare nessuna funzione di sicurezza.
+
+   INTEGRAZIONE
+   ------------
+   * Richiamare il PRG nel task DOPO la normale gestione winda, cosi' i setpoint
+     forzati qui (0 / limitati) sono gli ultimi scritti.
+   * Il vecchio blocco
          IF g_io.Standbremsentest THEN
              IO_Hauptinverter.Solldrehmoment := DMStandbremsentest; ...
-     entfaellt - die Sollwertvorgabe erfolgt jetzt ausschliesslich hier.
-   * g_IO.Standbremsentest ist jetzt reines Bypass-Bit fuer die Bremsen-
-     Freigabekette (SB ist beim Test ZU, Antrieb muss trotzdem Moment geben).
-     Fuer den Betriebsbremsentest ist in der GVL zusaetzlich
+     va rimosso: i setpoint ora li scrive solo questo PRG.
+   * g_IO.Standbremsentest diventa puro bit di bypass per la catena di consenso
+     dei freni (durante la prova la SB e' CHIUSA ma l'azionamento deve dare coppia).
+   * Per la prova del freno di servizio aggiungere nella GVL
          Betriebsbremsentest : BOOL;
-     anzulegen und die Freigabekette zu erweitern:
+     ed estendere la catena di consenso:
          g_IO.AlleBremsenoffen := (g_IO.SBoffen OR g_IO.Standbremsentest)
                               AND (g_IO.BBoffen OR g_IO.Betriebsbremsentest);
-   * Die mit TODO markierten Zeilen sind die Schnittstellen zur Anlage und
-     muessen einmalig auf die realen Variablennamen/Typen angepasst werden.
+   * Le righe marcate TODO sono le interfacce verso l'impianto: vanno adattate
+     una sola volta ai nomi/tipi reali del progetto.
    ================================================================================ *)
 
 PROGRAM TestBremse_Controls
 VAR CONSTANT
-    (* ---- Schrittkette ---- *)
-    SCHRITT_GESPERRT        : INT := 0;    (* Bremsmodus nicht angewaehlt          *)
-    SCHRITT_BEREIT          : INT := 10;   (* Modus aktiv, alle Bremsen zu         *)
-    SCHRITT_OEFFNEN         : INT := 20;   (* Oeffnungsbefehl, warten auf RM offen *)
-    SCHRITT_OFFEN           : INT := 30;   (* eine Bremse offen (Lueftspalt)       *)
-    SCHRITT_TEST_RAMPE      : INT := 40;   (* Moment rampenfoermig aufbauen        *)
-    SCHRITT_TEST_HALTEN     : INT := 50;   (* Pruefmoment halten, Schlupf pruefen  *)
-    SCHRITT_TEST_ABBAU      : INT := 60;   (* Moment abbauen                       *)
-    SCHRITT_SCHLIESSEN      : INT := 70;   (* manuelles Schliessen (Pflicht)       *)
-    SCHRITT_STOERUNG        : INT := 90;   (* Stoerung, quittieren erforderlich    *)
+    (* ---- Passi della sequenza ---- *)
+    STEP_LOCKED             : INT := 0;    (* modo freni non selezionato            *)
+    STEP_READY              : INT := 10;   (* modo attivo, entrambi i freni chiusi  *)
+    STEP_OPENING            : INT := 20;   (* comando di apertura, attesa feedback  *)
+    STEP_OPEN               : INT := 30;   (* un freno aperto (misura traferro)     *)
+    STEP_TEST_RAMP          : INT := 40;   (* salita a rampa della coppia           *)
+    STEP_TEST_HOLD          : INT := 50;   (* mantenimento coppia, verifica slittam.*)
+    STEP_TEST_RAMPDOWN      : INT := 60;   (* discesa della coppia                  *)
+    STEP_CLOSING            : INT := 70;   (* chiusura manuale (obbligatoria)       *)
+    STEP_FAULT              : INT := 90;   (* anomalia, serve il reset              *)
 
-    (* ---- Bremsenauswahl ---- *)
-    BREMSE_KEINE            : INT := 0;
-    BREMSE_SB               : INT := 1;    (* Standbremse    *)
-    BREMSE_BB               : INT := 2;    (* Betriebsbremse *)
+    (* ---- Selezione del freno ---- *)
+    BRAKE_NONE              : INT := 0;
+    BRAKE_SB                : INT := 1;    (* Standbremse    - freno di stazionamento *)
+    BRAKE_BB                : INT := 2;    (* Betriebsbremse - freno di servizio      *)
 
-    (* ---- Funktionsauswahl ---- *)
-    FUNKTION_KEINE          : INT := 0;
-    FUNKTION_LUEFTSPALT     : INT := 1;    (* nur oeffnen, KEIN Moment *)
-    FUNKTION_BREMSTEST      : INT := 2;    (* Moment gegen geschlossene Bremse *)
+    (* ---- Selezione della funzione ---- *)
+    MODE_NONE               : INT := 0;
+    MODE_AIRGAP             : INT := 1;    (* solo apertura, NESSUNA coppia           *)
+    MODE_BRAKETEST          : INT := 2;    (* coppia contro il freno chiuso           *)
 
-    (* ---- Stoercodes ---- *)
-    ERR_KEIN                : INT := 0;
-    ERR_SERVICEMODE         : INT := 1;    (* Service-Mode abgefallen           *)
-    ERR_USERLEVEL           : INT := 2;    (* Userlevel < 2                     *)
-    ERR_NOTAUS              : INT := 3;    (* Not-Aus / Pilz nicht ok           *)
-    ERR_BEIDE_OFFEN         : INT := 4;    (* beide Bremsen gleichzeitig offen  *)
-    ERR_BEWEGUNG            : INT := 5;    (* Drehzahl ausserhalb Fenster       *)
-    ERR_MOMENT              : INT := 6;    (* Istmoment unzulaessig             *)
-    ERR_RM_OEFFNEN          : INT := 7;    (* Rueckmeldung "offen" fehlt        *)
-    ERR_RM_SCHLIESSEN       : INT := 8;    (* Rueckmeldung "zu" fehlt           *)
-    ERR_TEST_NOK            : INT := 9;    (* Bremse haelt Pruefmoment nicht    *)
-    ERR_ZEIT_OFFEN          : INT := 10;   (* max. Offenzeit ueberschritten     *)
-    ERR_BETRIEBSART         : INT := 11;   (* Normalbetrieb/Sim/IBN aktiv       *)
-    ERR_ANTRIEB             : INT := 12;   (* Umrichter nicht bereit / Stoerung *)
+    (* ---- Codici di anomalia ---- *)
+    ERR_NONE                : INT := 0;
+    ERR_SERVICEMODE         : INT := 1;    (* Service Mode caduto                     *)
+    ERR_USERLEVEL           : INT := 2;    (* livello utente < 2                      *)
+    ERR_ESTOP               : INT := 3;    (* Notaus / Pilz non ok                    *)
+    ERR_BOTH_OPEN           : INT := 4;    (* entrambi i freni aperti insieme         *)
+    ERR_MOVEMENT            : INT := 5;    (* giri fuori finestra ammessa             *)
+    ERR_TORQUE              : INT := 6;    (* coppia reale non ammessa                *)
+    ERR_FB_OPEN             : INT := 7;    (* manca il feedback "aperto"              *)
+    ERR_FB_CLOSED           : INT := 8;    (* manca il feedback "chiuso"              *)
+    ERR_TEST_FAILED         : INT := 9;    (* il freno non tiene la coppia di prova   *)
+    ERR_OPEN_TIMEOUT        : INT := 10;   (* superato il tempo massimo di apertura   *)
+    ERR_OPMODE              : INT := 11;   (* messa in servizio / simulazione attiva  *)
+    ERR_DRIVE               : INT := 12;   (* inverter non pronto / in blocco         *)
 
-    MIN_USERLEVEL           : INT := 2;    (* Vorgabe: Nutzerlevel 2            *)
-    ZYKLUS_MS               : REAL := 10.0;(* TODO: an Taskzykluszeit anpassen   *)
+    MIN_USERLEVEL           : INT := 2;    (* richiesta: livello utente 2             *)
+    CYCLE_MS                : REAL := 10.0;(* TODO: allineare al ciclo del task       *)
 END_VAR
 
 VAR
     (* ============================================================
-       1) Bedienung (Visu schreibt direkt auf diese Variablen)
-          Buttons als "Variable tasten" (FALSE->TRUE) projektieren,
-          Auswertung erfolgt flankengetriggert.
-          Button-Sperre in der Visu bleibt zusaetzlich bestehen:
+       1) COMANDI DA DISPLAY
+          La visu scrive direttamente su queste variabili.
+          Configurare i pulsanti come "variabile a impulso" (FALSE->TRUE):
+          la valutazione avviene sul fronte di salita.
+          Restano in piedi anche i blocchi gia' presenti nella visu:
           ((IOPilzWinde.K_NAok_VZ) AND (g_IO.ServiceMode)
            AND (CurrentUserLevel>=2)) = FALSE
        ============================================================ *)
-    xBedienModusEin         : BOOL;   (* Bremsmodus anwaehlen                    *)
-    xBedienModusAus         : BOOL;   (* Bremsmodus verlassen                    *)
-    xWahlSB                 : BOOL;   (* Standbremse anwaehlen                   *)
-    xWahlBB                 : BOOL;   (* Betriebsbremse anwaehlen                *)
-    xWahlLueftspalt         : BOOL;   (* Funktion Lueftspaltkontrolle            *)
-    xWahlBremstest          : BOOL;   (* Funktion Bremstest                      *)
-    xQuittungGefahr         : BOOL;   (* Checkbox: Klemmgefahr / Winde entlastet *)
-    xBedienOeffnen          : BOOL;   (* angewaehlte Bremse oeffnen              *)
-    xBedienSchliessen       : BOOL;   (* Bremse manuell schliessen (Pflicht!)    *)
-    xBedienTestStart        : BOOL;   (* Bremstest starten                       *)
-    xBedienTestStop         : BOOL;   (* Bremstest abbrechen                     *)
-    xBedienQuittieren       : BOOL;   (* Stoerung quittieren                     *)
-    iTestRichtung           : INT := 1; (* +1 = Zugrichtung, -1 = Gegenrichtung  *)
+    xCmdModeOn              : BOOL;   (* selezione del modo freni                  *)
+    xCmdModeOff             : BOOL;   (* uscita dal modo freni                     *)
+    xCmdSelectSB            : BOOL;   (* seleziona il freno di stazionamento       *)
+    xCmdSelectBB            : BOOL;   (* seleziona il freno di servizio            *)
+    xCmdSelectAirgap        : BOOL;   (* funzione controllo traferro               *)
+    xCmdSelectBrakeTest     : BOOL;   (* funzione prova freni                      *)
+    xAckHazard              : BOOL;   (* conferma: pericolo schiacciamento / winda scarica *)
+    xCmdOpen                : BOOL;   (* apri il freno selezionato                 *)
+    xCmdClose               : BOOL;   (* chiudi manualmente il freno (obbligatorio)*)
+    xCmdTestStart           : BOOL;   (* avvia la prova freni                      *)
+    xCmdTestStop            : BOOL;   (* interrompi la prova freni                 *)
+    xCmdReset               : BOOL;   (* reset anomalia                            *)
+    iTestDirection          : INT := 1; (* +1 = senso di tiro, -1 = senso opposto  *)
 
     (* ============================================================
-       2) Parameter (online einstellbar, ggf. als PERSISTENT fuehren)
-          Alle Werte anlagenspezifisch parametrieren!
+       2) PARAMETRI (regolabili online, volendo da tenere PERSISTENT)
+          Tutti i valori vanno tarati sull'impianto specifico.
        ============================================================ *)
-    rRpmStillstand          : REAL := 2.0;    (* U/min: Stillstandsfenster fuer Freigabe   *)
-    rRpmAbschaltung         : REAL := 5.0;    (* U/min: Bewegung bei offener Bremse -> Halt*)
-    rRpmSchlupfGrenze       : REAL := 3.0;    (* U/min: zul. Schlupf im Bremstest          *)
-    rRpmSollTest            : REAL := 5.0;    (* U/min: Drehzahlsollwert im Bremstest      *)
-    rSchlupfGrenzeUmdr      : REAL := 0.05;   (* Umdr.: zul. Verdrehung im Bremstest       *)
-    rDMStillstand           : REAL := 5.0;    (* zul. Istmoment vor dem Oeffnen            *)
-    rDMTest_SB              : REAL := 0.0;    (* Pruefmoment Standbremse    -> parametrieren*)
-    rDMTest_BB              : REAL := 0.0;    (* Pruefmoment Betriebsbremse -> parametrieren*)
-    rDMMaxZulaessig         : REAL := 0.0;    (* harte Obergrenze Sollmoment-> parametrieren*)
-    rRampeDMproSek          : REAL := 10.0;   (* Momentaufbau je Sekunde                   *)
-    tHaltezeitTest          : TIME := T#5S;   (* Haltezeit Pruefmoment                     *)
-    tUeberwOeffnen          : TIME := T#3S;   (* Zeit bis RM "offen" erwartet wird         *)
-    tUeberwSchliessen       : TIME := T#3S;   (* Zeit bis RM "zu" erwartet wird            *)
-    tMaxOffen               : TIME := T#30M;  (* max. Zeit mit offener Bremse              *)
-    tQuittungGueltig        : TIME := T#60S;  (* Gueltigkeit der Gefahren-Quittung         *)
-    tUeberwMomentfrei       : TIME := T#1S;   (* Verzoegerung Ueberwachung "momentfrei"     *)
-    xAutoCloseBeiZeit       : BOOL := FALSE;  (* TRUE: nach tMaxOffen zwangsweise schliessen*)
+    rRpmStandstill          : REAL := 2.0;    (* giri/min: finestra di fermo per il consenso *)
+    rRpmTripOpen            : REAL := 5.0;    (* giri/min: movimento a freno aperto -> stop  *)
+    rRpmSlipLimit           : REAL := 3.0;    (* giri/min: slittamento ammesso nella prova   *)
+    rRpmTestSetpoint        : REAL := 5.0;    (* giri/min: setpoint giri durante la prova    *)
+    rSlipLimitRev           : REAL := 0.05;   (* giri: rotazione ammessa nella prova         *)
+    rTorqueStandstill       : REAL := 5.0;    (* coppia reale ammessa prima di aprire        *)
+    rTorqueTestSB           : REAL := 0.0;    (* coppia di prova SB  -> da parametrizzare    *)
+    rTorqueTestBB           : REAL := 0.0;    (* coppia di prova BB  -> da parametrizzare    *)
+    rTorqueMax              : REAL := 0.0;    (* limite superiore duro -> da parametrizzare  *)
+    rTorqueRampPerSec       : REAL := 10.0;   (* incremento di coppia al secondo             *)
+    tTestHoldTime           : TIME := T#5S;   (* tempo di mantenimento della coppia di prova *)
+    tMonOpen                : TIME := T#3S;   (* attesa massima del feedback "aperto"        *)
+    tMonClose               : TIME := T#3S;   (* attesa massima del feedback "chiuso"        *)
+    tMaxOpen                : TIME := T#30M;  (* tempo massimo con un freno aperto           *)
+    tAckValid               : TIME := T#60S;  (* validita' della conferma del pericolo       *)
+    tMonTorqueFree          : TIME := T#1S;   (* ritardo sorveglianza "coppia libera"        *)
+    xAutoCloseOnTimeout     : BOOL := FALSE;  (* TRUE: chiude d'ufficio dopo tMaxOpen        *)
 
     (* ============================================================
-       3) Istwerte / Rueckmeldungen (Abbild, Zuweisung im Abschnitt A)
+       3) VALORI REALI / FEEDBACK (immagine, assegnata nella sezione A)
        ============================================================ *)
-    rIstRpm                 : REAL;
-    rIstDM                  : REAL;
-    iUserlevel              : INT;
-    xSB_Ist_Offen           : BOOL;
-    xSB_Ist_Zu              : BOOL;
-    xBB_Ist_Offen           : BOOL;
-    xBB_Ist_Zu              : BOOL;
-    xServiceMode            : BOOL;
-    xNotAusOK               : BOOL;
-    xAntriebBereit          : BOOL;
-    xSperreBetriebsart      : BOOL;   (* IBN / Simulation / Normalbetrieb aktiv *)
+    rActRpm                 : REAL;   (* giri reali                                *)
+    rActTorque              : REAL;   (* coppia reale                              *)
+    iUserLevel              : INT;    (* livello utente attuale                    *)
+    xSB_IsOpen              : BOOL;   (* feedback: SB aperto                       *)
+    xSB_IsClosed            : BOOL;   (* feedback: SB chiuso                       *)
+    xBB_IsOpen              : BOOL;   (* feedback: BB aperto                       *)
+    xBB_IsClosed            : BOOL;   (* feedback: BB chiuso                       *)
+    xServiceMode            : BOOL;   (* chiave di Service Mode                    *)
+    xEStopOK                : BOOL;   (* catena Notaus in ordine (Pilz)            *)
+    xDriveReady             : BOOL;   (* inverter pronto, senza blocchi            *)
+    xOpModeBlock            : BOOL;   (* messa in servizio / simulazione / marcia   *)
 
     (* ============================================================
-       4) Freigaben / Status
+       4) CONSENSI E STATO
        ============================================================ *)
-    xFrg_ServiceMode        : BOOL;
-    xFrg_Userlevel          : BOOL;
-    xFrg_NotAus             : BOOL;
-    xFrg_Betriebsart        : BOOL;
-    xFrg_Antrieb            : BOOL;
-    xFrg_Stillstand         : BOOL;
-    xFrg_MomentFrei         : BOOL;
-    xFrg_Gesamt             : BOOL;   (* Dauerbedingung waehrend des Modus *)
-    xFrg_Oeffnen            : BOOL;   (* Transitionsbedingung "oeffnen"    *)
-    xFrg_TestStart          : BOOL;   (* Transitionsbedingung "Test start" *)
+    xEn_ServiceMode         : BOOL;
+    xEn_UserLevel           : BOOL;
+    xEn_EStop               : BOOL;
+    xEn_OpMode              : BOOL;
+    xEn_Drive               : BOOL;
+    xEn_Standstill          : BOOL;
+    xEn_TorqueFree          : BOOL;
+    xEn_Overall             : BOOL;   (* condizione permanente durante il modo     *)
+    xEn_Open                : BOOL;   (* condizione di transizione "apri"          *)
+    xEn_TestStart           : BOOL;   (* condizione di transizione "avvia prova"   *)
 
-    (* ---- Hauptstatus / Ausgaenge des PRG ---- *)
-    xTestBremseAktiv        : BOOL;   (* Bremsmodus aktiv -> Normalbetrieb sperren *)
-    xTestBremseOffen        : BOOL;   (* eine Bremse ist geoeffnet                 *)
-    xBremstestLaeuft        : BOOL;
-    xBremstestOK            : BOOL;
-    xBremstestNOK           : BOOL;
-    xManuellSchliessenNoetig: BOOL;   (* Verriegelung bis manuell geschlossen      *)
-    xBefehlSB_Oeffnen       : BOOL;   (* Ansteuerung Standbremse lueften           *)
-    xBefehlBB_Oeffnen       : BOOL;   (* Ansteuerung Betriebsbremse lueften        *)
+    (* ---- Stato principale / uscite del PRG ---- *)
+    xBrakeModeActive        : BOOL;   (* modo freni attivo -> blocca il normale funzionamento *)
+    xBrakeIsOpen            : BOOL;   (* un freno risulta aperto                   *)
+    xTestRunning            : BOOL;   (* prova freni in corso                      *)
+    xTestPassed             : BOOL;   (* esito prova: i.O.                         *)
+    xTestFailed             : BOOL;   (* esito prova: n.i.O.                       *)
+    xManualCloseRequired    : BOOL;   (* interblocco attivo fino alla chiusura manuale *)
+    xOutSB_Open             : BOOL;   (* comando di apertura SB                    *)
+    xOutBB_Open             : BOOL;   (* comando di apertura BB                    *)
     xBypassSB               : BOOL;   (* -> g_IO.Standbremsentest                  *)
-    xBypassBB               : BOOL;   (* -> g_IO.Betriebsbremsentest (neu in GVL)  *)
-    xAntriebFreigabeTest    : BOOL;   (* Umrichterfreigabe nur waehrend Bremstest  *)
+    xBypassBB               : BOOL;   (* -> g_IO.Betriebsbremsentest (nuova in GVL)*)
+    xDriveEnableTest        : BOOL;   (* consenso inverter solo durante la prova   *)
 
-    iSchritt                : INT := 0;
-    iBremseAngewaehlt       : INT := 0;
-    iBremseOffenLatch       : INT := 0;  (* Kernverriegelung: welche Bremse ist/war offen *)
-    iFunktion               : INT := 0;
-    iStoercode              : INT := 0;
-    iLetztesTestergebnis    : INT := 0;  (* 0=kein, 1=i.O., 2=n.i.O. *)
+    iStep                   : INT := 0;  (* passo attuale della sequenza           *)
+    iBrakeSelected          : INT := 0;  (* freno selezionato dall'operatore        *)
+    iBrakeOpenLatch         : INT := 0;  (* INTERBLOCCO: quale freno e'/era aperto  *)
+    iMode                   : INT := 0;  (* funzione selezionata                    *)
+    iFaultCode              : INT := 0;  (* codice di anomalia attuale              *)
+    iLastTestResult         : INT := 0;  (* 0 = nessuno, 1 = i.O., 2 = n.i.O.       *)
 
-    (* ---- Sollwerte Antrieb ---- *)
-    rDM_Soll                : REAL;      (* Momentgrenze/-sollwert, gerampt *)
-    rDM_Ziel                : REAL;      (* Pruefmoment der angewaehlten Bremse *)
-    rRpm_Soll               : REAL;
-    rRpm_Grenze             : REAL;
-    rRichtung               : REAL := 1.0;   (* +1.0 / -1.0 aus iTestRichtung *)
+    (* ---- Setpoint verso l'azionamento ---- *)
+    rTorqueSet              : REAL;   (* coppia di riferimento, rampata            *)
+    rTorqueTarget           : REAL;   (* coppia di prova del freno selezionato     *)
+    rRpmSet                 : REAL;   (* setpoint giri                             *)
+    rRpmLimit               : REAL;   (* limite giri applicato al setpoint         *)
+    rDirection              : REAL := 1.0; (* +1.0 / -1.0 ricavato da iTestDirection *)
 
-    (* ---- Messwerte Bremstest ---- *)
-    rSchlupfUmdr            : REAL;      (* aufintegrierte Verdrehung im Test *)
-    rMaxRpmImTest           : REAL;
-    rDM_ErreichtImTest      : REAL;
+    (* ---- Misure della prova freni ---- *)
+    rSlipRev                : REAL;   (* rotazione integrata durante la prova      *)
+    rMaxRpmInTest           : REAL;   (* picco di giri durante la prova            *)
+    rTorqueReachedInTest    : REAL;   (* coppia reale massima raggiunta            *)
 
-    (* ---- Flanken ---- *)
-    rtModusEin              : R_TRIG;
-    rtModusAus              : R_TRIG;
-    rtWahlSB                : R_TRIG;
-    rtWahlBB                : R_TRIG;
-    rtWahlLueftspalt        : R_TRIG;
-    rtWahlBremstest         : R_TRIG;
-    rtOeffnen               : R_TRIG;
-    rtSchliessen            : R_TRIG;
-    rtTestStart             : R_TRIG;
-    rtTestStop              : R_TRIG;
-    rtQuittieren            : R_TRIG;
+    (* ---- Rilevamento fronti ---- *)
+    rtrModeOn               : R_TRIG;
+    rtrModeOff              : R_TRIG;
+    rtrSelSB                : R_TRIG;
+    rtrSelBB                : R_TRIG;
+    rtrSelAirgap            : R_TRIG;
+    rtrSelBrakeTest         : R_TRIG;
+    rtrOpen                 : R_TRIG;
+    rtrClose                : R_TRIG;
+    rtrTestStart            : R_TRIG;
+    rtrTestStop             : R_TRIG;
+    rtrReset                : R_TRIG;
 
-    (* ---- Zeiten ---- *)
-    tonOeffnen              : TON;
-    tonSchliessen           : TON;
-    tonHaltezeit            : TON;
-    tonMaxOffen             : TON;
-    tonQuittung             : TON;
-    tonMomentfrei           : TON;
+    (* ---- Temporizzatori ---- *)
+    tonOpen                 : TON;    (* sorveglianza feedback "aperto"            *)
+    tonClose                : TON;    (* sorveglianza feedback "chiuso"            *)
+    tonHold                 : TON;    (* tempo di mantenimento della prova         *)
+    tonMaxOpen              : TON;    (* tempo massimo con freno aperto            *)
+    tonAck                  : TON;    (* scadenza della conferma del pericolo      *)
+    tonTorqueFree           : TON;    (* sorveglianza ritardata "coppia libera"    *)
 
-    (* ---- Diagnose fuer die Visu ---- *)
-    sSchrittText            : STRING(80);
-    sStoerText              : STRING(80);
-    xWarnungZeitOffen       : BOOL;
+    (* ---- Diagnostica per la visu ---- *)
+    sStepText               : STRING(80);  (* testo di stato (in tedesco, per l'operatore) *)
+    sFaultText              : STRING(80);  (* testo di anomalia (in tedesco)               *)
+    xWarnOpenTime           : BOOL;        (* avviso: freno aperto da troppo tempo         *)
 END_VAR
 
 (* ================================================================================
-   A) SCHNITTSTELLE ZUR ANLAGE - Istwerte einlesen
-      TODO: Namen/Typen einmalig gegen das Projekt pruefen
+   A) INTERFACCIA VERSO L'IMPIANTO - lettura dei valori reali
+      TODO: verificare una sola volta nomi e tipi rispetto al progetto
    ================================================================================ *)
-xServiceMode  := g_IO.ServiceMode;
-xNotAusOK     := IOPilzWinde.K_NAok_VZ;                  (* Not-Aus-Kreis ok, verzoegert *)
-iUserlevel    := CurrentUserLevel;                       (*TODO*) (* Quelle Userlevel pruefen *)
+xServiceMode := g_IO.ServiceMode;
+xEStopOK     := IOPilzWinde.K_NAok_VZ;                   (* catena Notaus ok, ritardata *)
+iUserLevel   := CurrentUserLevel;                        (*TODO*) (* verificare la sorgente del livello utente *)
 
-xSB_Ist_Offen := g_IO.SBoffen;
-xSB_Ist_Zu    := NOT g_IO.SBoffen;                       (*TODO*) (* falls eigene RM "SBzu" vorhanden, hier eintragen *)
-xBB_Ist_Offen := g_IO.BBoffen;
-xBB_Ist_Zu    := g_IO.BBzu;
+xSB_IsOpen   := g_IO.SBoffen;
+xSB_IsClosed := NOT g_IO.SBoffen;                        (*TODO*) (* se esiste un feedback "SBzu" dedicato, usarlo qui *)
+xBB_IsOpen   := g_IO.BBoffen;
+xBB_IsClosed := g_IO.BBzu;
 
-rIstRpm       := INT_TO_REAL(IO_Hauptinverter.IstRpmInverter);   (*TODO*) (* Name/Typ Drehzahl-Istwert *)
-rIstDM        := IO_Hauptinverter.Istdrehmoment;                 (*TODO*) (* Name/Typ Moment-Istwert   *)
-xAntriebBereit:= IO_Hauptinverter.Bereit;                        (*TODO*) (* Bereit-/Stoermeldung      *)
+rActRpm      := INT_TO_REAL(IO_Hauptinverter.IstRpmInverter);   (*TODO*) (* nome/tipo del valore reale giri  *)
+rActTorque   := IO_Hauptinverter.Istdrehmoment;                 (*TODO*) (* nome/tipo del valore reale coppia *)
+xDriveReady  := IO_Hauptinverter.Bereit;                        (*TODO*) (* segnale di pronto / blocco        *)
 
-(* Betriebsarten, die den Bremsmodus ausschliessen *)
-xSperreBetriebsart := App_Winde.inbetriebnahme;          (*TODO*) (* ggf. OR simbremsen OR Fahrbefehl *)
+(* Modi di funzionamento che escludono il modo freni *)
+xOpModeBlock := App_Winde.inbetriebnahme;                (*TODO*) (* eventualmente OR simbremsen OR comando di marcia *)
 
 (* ================================================================================
-   B) FREIGABEN
-      xFrg_Gesamt ist Dauerbedingung: faellt sie weg, wird sofort abgebrochen,
-      die Bremsbefehle werden weggenommen (Bremsen fallen federbetaetigt zu)
-      und der Momentsollwert wird auf 0 gesetzt.
+   B) CONSENSI
+      xEn_Overall e' una condizione PERMANENTE: se cade si interrompe subito,
+      i comandi di apertura vengono tolti (i freni si chiudono a molla) e il
+      setpoint di coppia va a zero.
    ================================================================================ *)
-xFrg_ServiceMode := xServiceMode;
-xFrg_Userlevel   := (iUserlevel >= MIN_USERLEVEL);       (* ggf. zusaetzlich AND PLC_PRG.userlevel3 *)
-xFrg_NotAus      := xNotAusOK;
-xFrg_Betriebsart := NOT xSperreBetriebsart;
-xFrg_Antrieb     := xAntriebBereit;
-xFrg_Stillstand  := (ABS(rIstRpm) <= rRpmStillstand);
-xFrg_MomentFrei  := (ABS(rIstDM)  <= rDMStillstand);
+xEn_ServiceMode := xServiceMode;
+xEn_UserLevel   := (iUserLevel >= MIN_USERLEVEL);        (* eventualmente AND PLC_PRG.userlevel3 *)
+xEn_EStop       := xEStopOK;
+xEn_OpMode      := NOT xOpModeBlock;
+xEn_Drive       := xDriveReady;
+xEn_Standstill  := (ABS(rActRpm) <= rRpmStandstill);
+xEn_TorqueFree  := (ABS(rActTorque) <= rTorqueStandstill);
 
-xFrg_Gesamt := xFrg_ServiceMode
-           AND xFrg_Userlevel
-           AND xFrg_NotAus
-           AND xFrg_Betriebsart
-           AND xFrg_Antrieb;
+xEn_Overall := xEn_ServiceMode
+           AND xEn_UserLevel
+           AND xEn_EStop
+           AND xEn_OpMode
+           AND xEn_Drive;
 
-(* Gefahren-Quittung laeuft ab -> vor jedem Oeffnen bewusst neu bestaetigen *)
-tonQuittung(IN := xQuittungGefahr, PT := tQuittungGueltig);
-IF tonQuittung.Q OR NOT xTestBremseAktiv THEN
-    xQuittungGefahr := FALSE;
+(* La conferma del pericolo scade: prima di ogni apertura va ridata coscientemente *)
+tonAck(IN := xAckHazard, PT := tAckValid);
+IF tonAck.Q OR NOT xBrakeModeActive THEN
+    xAckHazard := FALSE;
 END_IF
 
-(* Transitionsbedingungen fuer die Visu (Button-Enable) *)
-xFrg_Oeffnen := xFrg_Gesamt
-            AND xFrg_Stillstand
-            AND xFrg_MomentFrei
-            AND xQuittungGefahr
-            AND (iBremseOffenLatch = BREMSE_KEINE)      (* Kernforderung: nur eine Bremse *)
-            AND (iBremseAngewaehlt <> BREMSE_KEINE)
-            AND (iFunktion <> FUNKTION_KEINE)
-            AND xSB_Ist_Zu AND xBB_Ist_Zu
-            AND (iSchritt = SCHRITT_BEREIT);
+(* Condizioni di transizione, usate anche come enable dei pulsanti in visu *)
+xEn_Open := xEn_Overall
+        AND xEn_Standstill
+        AND xEn_TorqueFree
+        AND xAckHazard
+        AND (iBrakeOpenLatch = BRAKE_NONE)          (* punto chiave: un solo freno aperto *)
+        AND (iBrakeSelected <> BRAKE_NONE)
+        AND (iMode <> MODE_NONE)
+        AND xSB_IsClosed AND xBB_IsClosed
+        AND (iStep = STEP_READY);
 
-xFrg_TestStart := xFrg_Gesamt
-              AND (iSchritt = SCHRITT_OFFEN)
-              AND (iFunktion = FUNKTION_BREMSTEST)
-              AND xFrg_Stillstand
-              AND (rDM_Ziel > 0.0);
+xEn_TestStart := xEn_Overall
+             AND (iStep = STEP_OPEN)
+             AND (iMode = MODE_BRAKETEST)
+             AND xEn_Standstill
+             AND (rTorqueTarget > 0.0);
 
 (* ================================================================================
-   C) FLANKENAUSWERTUNG BEDIENUNG
+   C) VALUTAZIONE DEI COMANDI SUL FRONTE DI SALITA
    ================================================================================ *)
-rtModusEin(CLK := xBedienModusEin);
-rtModusAus(CLK := xBedienModusAus);
-rtWahlSB(CLK := xWahlSB);
-rtWahlBB(CLK := xWahlBB);
-rtWahlLueftspalt(CLK := xWahlLueftspalt);
-rtWahlBremstest(CLK := xWahlBremstest);
-rtOeffnen(CLK := xBedienOeffnen);
-rtSchliessen(CLK := xBedienSchliessen);
-rtTestStart(CLK := xBedienTestStart);
-rtTestStop(CLK := xBedienTestStop);
-rtQuittieren(CLK := xBedienQuittieren);
+rtrModeOn(CLK := xCmdModeOn);
+rtrModeOff(CLK := xCmdModeOff);
+rtrSelSB(CLK := xCmdSelectSB);
+rtrSelBB(CLK := xCmdSelectBB);
+rtrSelAirgap(CLK := xCmdSelectAirgap);
+rtrSelBrakeTest(CLK := xCmdSelectBrakeTest);
+rtrOpen(CLK := xCmdOpen);
+rtrClose(CLK := xCmdClose);
+rtrTestStart(CLK := xCmdTestStart);
+rtrTestStop(CLK := xCmdTestStop);
+rtrReset(CLK := xCmdReset);
 
-(* Anwahl Bremse/Funktion nur solange nichts offen und kein Test laeuft *)
-IF (iSchritt = SCHRITT_BEREIT) AND (iBremseOffenLatch = BREMSE_KEINE) THEN
-    IF rtWahlSB.Q THEN
-        iBremseAngewaehlt := BREMSE_SB;
-        iLetztesTestergebnis := 0;
+(* La selezione di freno e funzione e' possibile solo con tutto chiuso e nessuna prova in corso *)
+IF (iStep = STEP_READY) AND (iBrakeOpenLatch = BRAKE_NONE) THEN
+    IF rtrSelSB.Q THEN
+        iBrakeSelected  := BRAKE_SB;
+        iLastTestResult := 0;
     END_IF
-    IF rtWahlBB.Q THEN
-        iBremseAngewaehlt := BREMSE_BB;
-        iLetztesTestergebnis := 0;
+    IF rtrSelBB.Q THEN
+        iBrakeSelected  := BRAKE_BB;
+        iLastTestResult := 0;
     END_IF
-    IF rtWahlLueftspalt.Q THEN
-        iFunktion := FUNKTION_LUEFTSPALT;
+    IF rtrSelAirgap.Q THEN
+        iMode := MODE_AIRGAP;
     END_IF
-    IF rtWahlBremstest.Q THEN
-        iFunktion := FUNKTION_BREMSTEST;
+    IF rtrSelBrakeTest.Q THEN
+        iMode := MODE_BRAKETEST;
     END_IF
 END_IF
 
-(* Testrichtung auf +1 / -1 normieren *)
-IF iTestRichtung >= 0 THEN
-    rRichtung := 1.0;
+(* Normalizzazione del senso di prova a +1 / -1 *)
+IF iTestDirection >= 0 THEN
+    rDirection := 1.0;
 ELSE
-    rRichtung := -1.0;
+    rDirection := -1.0;
 END_IF
 
-(* Pruefmoment der angewaehlten Bremse: getestet wird immer die GESCHLOSSENE
-   Bremse - geoeffnet wird die jeweils andere.                                  *)
-CASE iBremseAngewaehlt OF
-    BREMSE_SB:  rDM_Ziel := LIMIT(0.0, rDMTest_SB, rDMMaxZulaessig);
-    BREMSE_BB:  rDM_Ziel := LIMIT(0.0, rDMTest_BB, rDMMaxZulaessig);
+(* Coppia di prova del freno selezionato: si prova sempre il freno CHIUSO,
+   quello che viene aperto e' l'altro.                                        *)
+CASE iBrakeSelected OF
+    BRAKE_SB:  rTorqueTarget := LIMIT(0.0, rTorqueTestSB, rTorqueMax);
+    BRAKE_BB:  rTorqueTarget := LIMIT(0.0, rTorqueTestBB, rTorqueMax);
 ELSE
-    rDM_Ziel := 0.0;
+    rTorqueTarget := 0.0;
 END_CASE
 
 (* ================================================================================
-   D) HARTE UEBERWACHUNGEN - gelten in jedem Schritt des Bremsmodus
+   D) SORVEGLIANZE DURE - valgono in ogni passo del modo freni
    ================================================================================ *)
-IF xTestBremseAktiv THEN
+IF xBrakeModeActive THEN
 
-    (* D1 - Grundfreigaben weggefallen *)
-    IF NOT xFrg_Gesamt THEN
-        IF NOT xFrg_NotAus THEN
-            iStoercode := ERR_NOTAUS;
-        ELSIF NOT xFrg_ServiceMode THEN
-            iStoercode := ERR_SERVICEMODE;
-        ELSIF NOT xFrg_Userlevel THEN
-            iStoercode := ERR_USERLEVEL;
-        ELSIF NOT xFrg_Betriebsart THEN
-            iStoercode := ERR_BETRIEBSART;
+    (* D1 - caduta di uno dei consensi di base *)
+    IF NOT xEn_Overall THEN
+        IF NOT xEn_EStop THEN
+            iFaultCode := ERR_ESTOP;
+        ELSIF NOT xEn_ServiceMode THEN
+            iFaultCode := ERR_SERVICEMODE;
+        ELSIF NOT xEn_UserLevel THEN
+            iFaultCode := ERR_USERLEVEL;
+        ELSIF NOT xEn_OpMode THEN
+            iFaultCode := ERR_OPMODE;
         ELSE
-            iStoercode := ERR_ANTRIEB;
+            iFaultCode := ERR_DRIVE;
         END_IF
-        iSchritt := SCHRITT_STOERUNG;
+        iStep := STEP_FAULT;
     END_IF
 
-    (* D2 - niemals beide Bremsen gleichzeitig offen *)
-    IF xSB_Ist_Offen AND xBB_Ist_Offen THEN
-        iStoercode := ERR_BEIDE_OFFEN;
-        iSchritt   := SCHRITT_STOERUNG;
+    (* D2 - mai entrambi i freni aperti nello stesso momento *)
+    IF xSB_IsOpen AND xBB_IsOpen THEN
+        iFaultCode := ERR_BOTH_OPEN;
+        iStep      := STEP_FAULT;
     END_IF
 
-    (* D3 - Bewegung bei offener Bremse ausserhalb des Bremstests *)
-    IF (iSchritt = SCHRITT_OEFFNEN) OR (iSchritt = SCHRITT_OFFEN) OR (iSchritt = SCHRITT_SCHLIESSEN) THEN
-        IF ABS(rIstRpm) > rRpmAbschaltung THEN
-            iStoercode := ERR_BEWEGUNG;
-            iSchritt   := SCHRITT_STOERUNG;
-        END_IF
-    END_IF
-
-    (* D4 - Momentueberwachung
-       - waehrend des Bremstests: Istmoment darf die Obergrenze nicht ueberschreiten
-       - ausserhalb des Bremstests: bei offener Bremse muss der Antrieb momentfrei sein *)
-    IF xBremstestLaeuft THEN
-        IF (rDMMaxZulaessig > 0.0) AND (ABS(rIstDM) > rDMMaxZulaessig * 1.1) THEN
-            rDM_Soll   := 0.0;
-            iStoercode := ERR_MOMENT;
-            iSchritt   := SCHRITT_STOERUNG;
+    (* D3 - movimento a freno aperto fuori dalla prova freni *)
+    IF (iStep = STEP_OPENING) OR (iStep = STEP_OPEN) OR (iStep = STEP_CLOSING) THEN
+        IF ABS(rActRpm) > rRpmTripOpen THEN
+            iFaultCode := ERR_MOVEMENT;
+            iStep      := STEP_FAULT;
         END_IF
     END_IF
 
-    (* Momentfreiheit bei offener Bremse ohne laufenden Test - kurz verzoegert,
-       damit der Momentabbau nach einem Bremstest nicht als Stoerung gilt *)
-    tonMomentfrei(IN := xTestBremseOffen AND NOT xBremstestLaeuft AND NOT xFrg_MomentFrei,
-                  PT := tUeberwMomentfrei);
-    IF tonMomentfrei.Q THEN
-        rDM_Soll   := 0.0;
-        iStoercode := ERR_MOMENT;
-        iSchritt   := SCHRITT_STOERUNG;
+    (* D4 - sorveglianza della coppia
+       - durante la prova: la coppia reale non deve superare il limite massimo
+       - fuori dalla prova: con un freno aperto l'azionamento deve essere scarico *)
+    IF xTestRunning THEN
+        IF (rTorqueMax > 0.0) AND (ABS(rActTorque) > rTorqueMax * 1.1) THEN
+            rTorqueSet := 0.0;
+            iFaultCode := ERR_TORQUE;
+            iStep      := STEP_FAULT;
+        END_IF
     END_IF
 
-    (* D5 - Ueberwachung der maximalen Offenzeit *)
-    tonMaxOffen(IN := xTestBremseOffen, PT := tMaxOffen);
-    xWarnungZeitOffen := tonMaxOffen.Q;
-    IF tonMaxOffen.Q AND xAutoCloseBeiZeit AND (iSchritt = SCHRITT_OFFEN) THEN
-        iStoercode := ERR_ZEIT_OFFEN;
-        iSchritt   := SCHRITT_SCHLIESSEN;
+    (* Coppia libera a freno aperto senza prova in corso: leggermente ritardata,
+       cosi' la discesa di coppia dopo una prova non viene letta come anomalia *)
+    tonTorqueFree(IN := xBrakeIsOpen AND NOT xTestRunning AND NOT xEn_TorqueFree,
+                  PT := tMonTorqueFree);
+    IF tonTorqueFree.Q THEN
+        rTorqueSet := 0.0;
+        iFaultCode := ERR_TORQUE;
+        iStep      := STEP_FAULT;
+    END_IF
+
+    (* D5 - sorveglianza del tempo massimo di apertura *)
+    tonMaxOpen(IN := xBrakeIsOpen, PT := tMaxOpen);
+    xWarnOpenTime := tonMaxOpen.Q;
+    IF tonMaxOpen.Q AND xAutoCloseOnTimeout AND (iStep = STEP_OPEN) THEN
+        iFaultCode := ERR_OPEN_TIMEOUT;
+        iStep      := STEP_CLOSING;
     END_IF
 ELSE
-    tonMaxOffen(IN := FALSE, PT := tMaxOffen);
-    tonMomentfrei(IN := FALSE, PT := tUeberwMomentfrei);
-    xWarnungZeitOffen := FALSE;
+    tonMaxOpen(IN := FALSE, PT := tMaxOpen);
+    tonTorqueFree(IN := FALSE, PT := tMonTorqueFree);
+    xWarnOpenTime := FALSE;
 END_IF
 
 (* ================================================================================
-   E) SCHRITTKETTE
-      Die Zeitglieder werden zyklisch und unabhaengig vom aktiven Schritt
-      aufgerufen. Dadurch werden sie beim Verlassen eines Schrittes sicher
-      zurueckgesetzt (auch bei einem Abbruch ueber Abschnitt D).
+   E) SEQUENZA A PASSI
+      I temporizzatori sono richiamati ciclicamente e indipendentemente dal passo
+      attivo: cosi' si azzerano in modo sicuro appena si lascia il passo, anche
+      quando l'uscita avviene per un'interruzione della sezione D.
    ================================================================================ *)
-tonOeffnen(IN := (iSchritt = SCHRITT_OEFFNEN),     PT := tUeberwOeffnen);
-tonSchliessen(IN := (iSchritt = SCHRITT_SCHLIESSEN), PT := tUeberwSchliessen);
-tonHaltezeit(IN := (iSchritt = SCHRITT_TEST_HALTEN), PT := tHaltezeitTest);
+tonOpen(IN := (iStep = STEP_OPENING),   PT := tMonOpen);
+tonClose(IN := (iStep = STEP_CLOSING),  PT := tMonClose);
+tonHold(IN := (iStep = STEP_TEST_HOLD), PT := tTestHoldTime);
 
-CASE iSchritt OF
-
-(* ---------------------------------------------------------------- *)
-SCHRITT_GESPERRT:
-    xTestBremseAktiv  := FALSE;
-    xBremstestLaeuft  := FALSE;
-    xBefehlSB_Oeffnen := FALSE;
-    xBefehlBB_Oeffnen := FALSE;
-    xBypassSB         := FALSE;
-    xBypassBB         := FALSE;
-    rDM_Soll          := 0.0;
-    rRpm_Soll         := 0.0;
-    iFunktion         := FUNKTION_KEINE;
-    iBremseAngewaehlt := BREMSE_KEINE;
-    iStoercode        := ERR_KEIN;
-
-    (* Verriegelung nur aufheben, wenn beide Bremsen sicher geschlossen sind *)
-    IF xSB_Ist_Zu AND xBB_Ist_Zu THEN
-        iBremseOffenLatch := BREMSE_KEINE;
-    END_IF
-
-    IF rtModusEin.Q AND xFrg_Gesamt AND xFrg_Stillstand AND xSB_Ist_Zu AND xBB_Ist_Zu THEN
-        xTestBremseAktiv := TRUE;
-        iSchritt := SCHRITT_BEREIT;
-    END_IF
+CASE iStep OF
 
 (* ---------------------------------------------------------------- *)
-SCHRITT_BEREIT:
-    xBefehlSB_Oeffnen := FALSE;
-    xBefehlBB_Oeffnen := FALSE;
-    xBypassSB         := FALSE;
-    xBypassBB         := FALSE;
-    xBremstestLaeuft  := FALSE;
-    rDM_Soll          := 0.0;
-    rRpm_Soll         := 0.0;
+STEP_LOCKED:
+    xBrakeModeActive := FALSE;
+    xTestRunning     := FALSE;
+    xOutSB_Open      := FALSE;
+    xOutBB_Open      := FALSE;
+    xBypassSB        := FALSE;
+    xBypassBB        := FALSE;
+    rTorqueSet       := 0.0;
+    rRpmSet          := 0.0;
+    iMode            := MODE_NONE;
+    iBrakeSelected   := BRAKE_NONE;
+    iFaultCode       := ERR_NONE;
 
-    IF xSB_Ist_Zu AND xBB_Ist_Zu THEN
-        iBremseOffenLatch := BREMSE_KEINE;
+    (* L'interblocco si sblocca solo con entrambi i freni sicuramente chiusi *)
+    IF xSB_IsClosed AND xBB_IsClosed THEN
+        iBrakeOpenLatch := BRAKE_NONE;
     END_IF
 
-    (* Oeffnen: geoeffnet wird die Bremse, die NICHT geprueft wird.
-       Lueftspaltkontrolle: geoeffnet wird die angewaehlte Bremse selbst. *)
-    IF rtOeffnen.Q AND xFrg_Oeffnen THEN
-        iStoercode      := ERR_KEIN;
-        xQuittungGefahr := FALSE;          (* Quittung ist verbraucht *)
-        rSchlupfUmdr    := 0.0;
-        rMaxRpmImTest   := 0.0;
-        rDM_ErreichtImTest := 0.0;
-        xBremstestOK    := FALSE;
-        xBremstestNOK   := FALSE;
+    IF rtrModeOn.Q AND xEn_Overall AND xEn_Standstill AND xSB_IsClosed AND xBB_IsClosed THEN
+        xBrakeModeActive := TRUE;
+        iStep := STEP_READY;
+    END_IF
 
-        IF iFunktion = FUNKTION_LUEFTSPALT THEN
-            (* zu pruefende Bremse oeffnen, die andere haelt *)
-            IF iBremseAngewaehlt = BREMSE_SB THEN
-                iBremseOffenLatch := BREMSE_SB;
+(* ---------------------------------------------------------------- *)
+STEP_READY:
+    xOutSB_Open  := FALSE;
+    xOutBB_Open  := FALSE;
+    xBypassSB    := FALSE;
+    xBypassBB    := FALSE;
+    xTestRunning := FALSE;
+    rTorqueSet   := 0.0;
+    rRpmSet      := 0.0;
+
+    IF xSB_IsClosed AND xBB_IsClosed THEN
+        iBrakeOpenLatch := BRAKE_NONE;
+    END_IF
+
+    (* Apertura: si apre il freno che NON viene provato.
+       Nel controllo del traferro si apre invece il freno selezionato stesso. *)
+    IF rtrOpen.Q AND xEn_Open THEN
+        iFaultCode           := ERR_NONE;
+        xAckHazard           := FALSE;          (* la conferma e' consumata *)
+        rSlipRev             := 0.0;
+        rMaxRpmInTest        := 0.0;
+        rTorqueReachedInTest := 0.0;
+        xTestPassed          := FALSE;
+        xTestFailed          := FALSE;
+
+        IF iMode = MODE_AIRGAP THEN
+            (* si apre il freno da controllare, l'altro tiene *)
+            IF iBrakeSelected = BRAKE_SB THEN
+                iBrakeOpenLatch := BRAKE_SB;
             ELSE
-                iBremseOffenLatch := BREMSE_BB;
+                iBrakeOpenLatch := BRAKE_BB;
             END_IF
         ELSE
-            (* Bremstest: die ANDERE Bremse oeffnen, angewaehlte haelt das Moment *)
-            IF iBremseAngewaehlt = BREMSE_SB THEN
-                iBremseOffenLatch := BREMSE_BB;
+            (* prova freni: si apre l'ALTRO freno, quello selezionato tiene la coppia *)
+            IF iBrakeSelected = BRAKE_SB THEN
+                iBrakeOpenLatch := BRAKE_BB;
             ELSE
-                iBremseOffenLatch := BREMSE_SB;
+                iBrakeOpenLatch := BRAKE_SB;
             END_IF
         END_IF
-        iSchritt := SCHRITT_OEFFNEN;
+        iStep := STEP_OPENING;
     END_IF
 
-    IF rtModusAus.Q AND (iBremseOffenLatch = BREMSE_KEINE) AND xSB_Ist_Zu AND xBB_Ist_Zu THEN
-        iSchritt := SCHRITT_GESPERRT;
-    END_IF
-
-(* ---------------------------------------------------------------- *)
-SCHRITT_OEFFNEN:
-    (* Befehl steht an, Rueckmeldung wird ueberwacht.
-       Die Verriegelung iBremseOffenLatch ist bereits gesetzt und bleibt
-       gesetzt, bis manuell geschlossen und die RM "zu" da ist.          *)
-    xBefehlSB_Oeffnen := (iBremseOffenLatch = BREMSE_SB);
-    xBefehlBB_Oeffnen := (iBremseOffenLatch = BREMSE_BB);
-    rDM_Soll  := 0.0;
-    rRpm_Soll := 0.0;
-
-    IF ((iBremseOffenLatch = BREMSE_SB) AND xSB_Ist_Offen AND xBB_Ist_Zu)
-    OR ((iBremseOffenLatch = BREMSE_BB) AND xBB_Ist_Offen AND xSB_Ist_Zu) THEN
-        iSchritt := SCHRITT_OFFEN;
-    ELSIF tonOeffnen.Q THEN
-        iStoercode := ERR_RM_OEFFNEN;
-        iSchritt   := SCHRITT_STOERUNG;
-    END_IF
-
-    (* jederzeitiger Abbruch durch den Bediener *)
-    IF rtSchliessen.Q OR rtTestStop.Q THEN
-        iSchritt := SCHRITT_SCHLIESSEN;
+    IF rtrModeOff.Q AND (iBrakeOpenLatch = BRAKE_NONE) AND xSB_IsClosed AND xBB_IsClosed THEN
+        iStep := STEP_LOCKED;
     END_IF
 
 (* ---------------------------------------------------------------- *)
-SCHRITT_OFFEN:
-    (* Eine Bremse ist offen: Lueftspalt messen/einstellen oder Bremstest starten.
-       Ohne laufenden Test steht der Antrieb momentfrei.                        *)
-    xBefehlSB_Oeffnen := (iBremseOffenLatch = BREMSE_SB);
-    xBefehlBB_Oeffnen := (iBremseOffenLatch = BREMSE_BB);
-    xBremstestLaeuft  := FALSE;
-    xBypassSB         := FALSE;
-    xBypassBB         := FALSE;
-    rDM_Soll          := 0.0;
-    rRpm_Soll         := 0.0;
+STEP_OPENING:
+    (* Il comando e' attivo e il feedback viene sorvegliato.
+       L'interblocco iBrakeOpenLatch e' gia' impostato e resta tale finche'
+       il freno non viene chiuso manualmente con feedback "chiuso" presente. *)
+    xOutSB_Open := (iBrakeOpenLatch = BRAKE_SB);
+    xOutBB_Open := (iBrakeOpenLatch = BRAKE_BB);
+    rTorqueSet  := 0.0;
+    rRpmSet     := 0.0;
 
-    IF rtTestStart.Q AND xFrg_TestStart THEN
-        rSchlupfUmdr  := 0.0;
-        rMaxRpmImTest := 0.0;
-        xBremstestOK  := FALSE;
-        xBremstestNOK := FALSE;
-        iSchritt      := SCHRITT_TEST_RAMPE;
+    IF ((iBrakeOpenLatch = BRAKE_SB) AND xSB_IsOpen AND xBB_IsClosed)
+    OR ((iBrakeOpenLatch = BRAKE_BB) AND xBB_IsOpen AND xSB_IsClosed) THEN
+        iStep := STEP_OPEN;
+    ELSIF tonOpen.Q THEN
+        iFaultCode := ERR_FB_OPEN;
+        iStep      := STEP_FAULT;
     END_IF
 
-    IF rtSchliessen.Q THEN
-        iSchritt := SCHRITT_SCHLIESSEN;
-    END_IF
-
-(* ---------------------------------------------------------------- *)
-SCHRITT_TEST_RAMPE:
-    (* Moment rampenfoermig gegen die geschlossene Bremse aufbauen.
-       Drehzahlsollwert bleibt im engen Testfenster - haelt die Bremse,
-       bleibt der Antrieb in der Momentbegrenzung stehen.              *)
-    xBremstestLaeuft  := TRUE;
-    xBefehlSB_Oeffnen := (iBremseOffenLatch = BREMSE_SB);
-    xBefehlBB_Oeffnen := (iBremseOffenLatch = BREMSE_BB);
-    xBypassSB         := (iBremseAngewaehlt = BREMSE_SB);   (* SB ist zu, Antrieb darf Moment geben *)
-    xBypassBB         := (iBremseAngewaehlt = BREMSE_BB);
-
-    rDM_Soll  := rDM_Soll + rRampeDMproSek * (ZYKLUS_MS / 1000.0);
-    IF rDM_Soll > rDM_Ziel THEN
-        rDM_Soll := rDM_Ziel;
-    END_IF
-    rRpm_Soll := rRpmSollTest * rRichtung;
-
-    (* Schlupfueberwachung *)
-    rSchlupfUmdr  := rSchlupfUmdr + ABS(rIstRpm) / 60.0 * (ZYKLUS_MS / 1000.0);
-    IF ABS(rIstRpm) > rMaxRpmImTest THEN
-        rMaxRpmImTest := ABS(rIstRpm);
-    END_IF
-    rDM_ErreichtImTest := ABS(rIstDM);
-
-    IF (ABS(rIstRpm) > rRpmSchlupfGrenze) OR (rSchlupfUmdr > rSchlupfGrenzeUmdr) THEN
-        xBremstestNOK := TRUE;
-        iLetztesTestergebnis := 2;
-        iStoercode := ERR_TEST_NOK;
-        iSchritt   := SCHRITT_TEST_ABBAU;
-    ELSIF rDM_Soll >= rDM_Ziel THEN
-        iSchritt := SCHRITT_TEST_HALTEN;
-    END_IF
-
-    IF rtTestStop.Q OR rtSchliessen.Q THEN
-        iSchritt := SCHRITT_TEST_ABBAU;
+    (* Interruzione da parte dell'operatore, sempre possibile *)
+    IF rtrClose.Q OR rtrTestStop.Q THEN
+        iStep := STEP_CLOSING;
     END_IF
 
 (* ---------------------------------------------------------------- *)
-SCHRITT_TEST_HALTEN:
-    xBremstestLaeuft  := TRUE;
-    xBefehlSB_Oeffnen := (iBremseOffenLatch = BREMSE_SB);
-    xBefehlBB_Oeffnen := (iBremseOffenLatch = BREMSE_BB);
-    xBypassSB         := (iBremseAngewaehlt = BREMSE_SB);
-    xBypassBB         := (iBremseAngewaehlt = BREMSE_BB);
-    rDM_Soll          := rDM_Ziel;
-    rRpm_Soll         := rRpmSollTest * rRichtung;
+STEP_OPEN:
+    (* Un freno e' aperto: si misura/regola il traferro oppure si avvia la prova.
+       Senza prova in corso l'azionamento resta scarico.                       *)
+    xOutSB_Open  := (iBrakeOpenLatch = BRAKE_SB);
+    xOutBB_Open  := (iBrakeOpenLatch = BRAKE_BB);
+    xTestRunning := FALSE;
+    xBypassSB    := FALSE;
+    xBypassBB    := FALSE;
+    rTorqueSet   := 0.0;
+    rRpmSet      := 0.0;
 
-    rSchlupfUmdr := rSchlupfUmdr + ABS(rIstRpm) / 60.0 * (ZYKLUS_MS / 1000.0);
-    IF ABS(rIstRpm) > rMaxRpmImTest THEN
-        rMaxRpmImTest := ABS(rIstRpm);
-    END_IF
-    rDM_ErreichtImTest := ABS(rIstDM);
-
-    IF (ABS(rIstRpm) > rRpmSchlupfGrenze) OR (rSchlupfUmdr > rSchlupfGrenzeUmdr) THEN
-        xBremstestNOK := TRUE;
-        iLetztesTestergebnis := 2;
-        iStoercode := ERR_TEST_NOK;
-        iSchritt   := SCHRITT_TEST_ABBAU;
-    ELSIF tonHaltezeit.Q THEN
-        xBremstestOK := TRUE;
-        iLetztesTestergebnis := 1;
-        iSchritt := SCHRITT_TEST_ABBAU;
+    IF rtrTestStart.Q AND xEn_TestStart THEN
+        rSlipRev      := 0.0;
+        rMaxRpmInTest := 0.0;
+        xTestPassed   := FALSE;
+        xTestFailed   := FALSE;
+        iStep         := STEP_TEST_RAMP;
     END_IF
 
-    IF rtTestStop.Q OR rtSchliessen.Q THEN
-        iSchritt := SCHRITT_TEST_ABBAU;
+    IF rtrClose.Q THEN
+        iStep := STEP_CLOSING;
     END_IF
 
 (* ---------------------------------------------------------------- *)
-SCHRITT_TEST_ABBAU:
-    (* Moment definiert abbauen, Bremse bleibt offen -> manuelles Schliessen bleibt Pflicht *)
-    xBremstestLaeuft  := TRUE;
-    xBefehlSB_Oeffnen := (iBremseOffenLatch = BREMSE_SB);
-    xBefehlBB_Oeffnen := (iBremseOffenLatch = BREMSE_BB);
-    xBypassSB         := (iBremseAngewaehlt = BREMSE_SB);
-    xBypassBB         := (iBremseAngewaehlt = BREMSE_BB);
-    rRpm_Soll         := 0.0;
+STEP_TEST_RAMP:
+    (* Salita a rampa della coppia contro il freno chiuso.
+       Il setpoint giri resta nella finestra stretta di prova: se il freno
+       tiene, l'azionamento resta fermo in limitazione di coppia.            *)
+    xTestRunning := TRUE;
+    xOutSB_Open  := (iBrakeOpenLatch = BRAKE_SB);
+    xOutBB_Open  := (iBrakeOpenLatch = BRAKE_BB);
+    xBypassSB    := (iBrakeSelected = BRAKE_SB);   (* SB chiusa: l'azionamento deve poter dare coppia *)
+    xBypassBB    := (iBrakeSelected = BRAKE_BB);
 
-    rDM_Soll := rDM_Soll - rRampeDMproSek * (ZYKLUS_MS / 1000.0);
-    IF rDM_Soll <= 0.0 THEN
-        rDM_Soll         := 0.0;
-        xBremstestLaeuft := FALSE;
-        xBypassSB        := FALSE;
-        xBypassBB        := FALSE;
-        IF xBremstestNOK THEN
-            iSchritt := SCHRITT_STOERUNG;     (* Ergebnis n.i.O. muss quittiert werden *)
+    rTorqueSet := rTorqueSet + rTorqueRampPerSec * (CYCLE_MS / 1000.0);
+    IF rTorqueSet > rTorqueTarget THEN
+        rTorqueSet := rTorqueTarget;
+    END_IF
+    rRpmSet := rRpmTestSetpoint * rDirection;
+
+    (* Sorveglianza dello slittamento *)
+    rSlipRev := rSlipRev + ABS(rActRpm) / 60.0 * (CYCLE_MS / 1000.0);
+    IF ABS(rActRpm) > rMaxRpmInTest THEN
+        rMaxRpmInTest := ABS(rActRpm);
+    END_IF
+    rTorqueReachedInTest := ABS(rActTorque);
+
+    IF (ABS(rActRpm) > rRpmSlipLimit) OR (rSlipRev > rSlipLimitRev) THEN
+        xTestFailed     := TRUE;
+        iLastTestResult := 2;
+        iFaultCode      := ERR_TEST_FAILED;
+        iStep           := STEP_TEST_RAMPDOWN;
+    ELSIF rTorqueSet >= rTorqueTarget THEN
+        iStep := STEP_TEST_HOLD;
+    END_IF
+
+    IF rtrTestStop.Q OR rtrClose.Q THEN
+        iStep := STEP_TEST_RAMPDOWN;
+    END_IF
+
+(* ---------------------------------------------------------------- *)
+STEP_TEST_HOLD:
+    (* Mantenimento della coppia di prova per il tempo impostato *)
+    xTestRunning := TRUE;
+    xOutSB_Open  := (iBrakeOpenLatch = BRAKE_SB);
+    xOutBB_Open  := (iBrakeOpenLatch = BRAKE_BB);
+    xBypassSB    := (iBrakeSelected = BRAKE_SB);
+    xBypassBB    := (iBrakeSelected = BRAKE_BB);
+    rTorqueSet   := rTorqueTarget;
+    rRpmSet      := rRpmTestSetpoint * rDirection;
+
+    rSlipRev := rSlipRev + ABS(rActRpm) / 60.0 * (CYCLE_MS / 1000.0);
+    IF ABS(rActRpm) > rMaxRpmInTest THEN
+        rMaxRpmInTest := ABS(rActRpm);
+    END_IF
+    rTorqueReachedInTest := ABS(rActTorque);
+
+    IF (ABS(rActRpm) > rRpmSlipLimit) OR (rSlipRev > rSlipLimitRev) THEN
+        xTestFailed     := TRUE;
+        iLastTestResult := 2;
+        iFaultCode      := ERR_TEST_FAILED;
+        iStep           := STEP_TEST_RAMPDOWN;
+    ELSIF tonHold.Q THEN
+        xTestPassed     := TRUE;
+        iLastTestResult := 1;
+        iStep           := STEP_TEST_RAMPDOWN;
+    END_IF
+
+    IF rtrTestStop.Q OR rtrClose.Q THEN
+        iStep := STEP_TEST_RAMPDOWN;
+    END_IF
+
+(* ---------------------------------------------------------------- *)
+STEP_TEST_RAMPDOWN:
+    (* Discesa controllata della coppia. Il freno resta aperto: la chiusura
+       manuale resta comunque obbligatoria.                                 *)
+    xTestRunning := TRUE;
+    xOutSB_Open  := (iBrakeOpenLatch = BRAKE_SB);
+    xOutBB_Open  := (iBrakeOpenLatch = BRAKE_BB);
+    xBypassSB    := (iBrakeSelected = BRAKE_SB);
+    xBypassBB    := (iBrakeSelected = BRAKE_BB);
+    rRpmSet      := 0.0;
+
+    rTorqueSet := rTorqueSet - rTorqueRampPerSec * (CYCLE_MS / 1000.0);
+    IF rTorqueSet <= 0.0 THEN
+        rTorqueSet   := 0.0;
+        xTestRunning := FALSE;
+        xBypassSB    := FALSE;
+        xBypassBB    := FALSE;
+        IF xTestFailed THEN
+            iStep := STEP_FAULT;      (* esito n.i.O.: va confermato con il reset *)
         ELSE
-            iSchritt := SCHRITT_OFFEN;        (* Bremse weiterhin offen, Bediener schliesst *)
+            iStep := STEP_OPEN;       (* freno ancora aperto, chiude l'operatore  *)
         END_IF
     END_IF
 
 (* ---------------------------------------------------------------- *)
-SCHRITT_SCHLIESSEN:
-    (* Manuelles Schliessen: Befehl weg -> federbetaetigte Bremse faellt zu.
-       Erst mit Rueckmeldung "zu" wird die Verriegelung aufgehoben und die
-       andere Bremse darf ueberhaupt wieder geoeffnet werden.               *)
-    xBefehlSB_Oeffnen := FALSE;
-    xBefehlBB_Oeffnen := FALSE;
-    xBypassSB         := FALSE;
-    xBypassBB         := FALSE;
-    xBremstestLaeuft  := FALSE;
-    rDM_Soll          := 0.0;
-    rRpm_Soll         := 0.0;
+STEP_CLOSING:
+    (* Chiusura manuale: tolto il comando, il freno si chiude a molla.
+       Solo con il feedback "chiuso" l'interblocco cade e l'altro freno
+       torna ad essere apribile.                                          *)
+    xOutSB_Open  := FALSE;
+    xOutBB_Open  := FALSE;
+    xBypassSB    := FALSE;
+    xBypassBB    := FALSE;
+    xTestRunning := FALSE;
+    rTorqueSet   := 0.0;
+    rRpmSet      := 0.0;
 
-    IF xSB_Ist_Zu AND xBB_Ist_Zu THEN
-        iBremseOffenLatch := BREMSE_KEINE;     (* Verriegelung aufgehoben *)
-        IF iStoercode <> ERR_KEIN THEN
-            iSchritt := SCHRITT_STOERUNG;
+    IF xSB_IsClosed AND xBB_IsClosed THEN
+        iBrakeOpenLatch := BRAKE_NONE;         (* interblocco sbloccato *)
+        IF iFaultCode <> ERR_NONE THEN
+            iStep := STEP_FAULT;
         ELSE
-            iSchritt := SCHRITT_BEREIT;
+            iStep := STEP_READY;
         END_IF
-    ELSIF tonSchliessen.Q THEN
-        iStoercode := ERR_RM_SCHLIESSEN;
-        iSchritt   := SCHRITT_STOERUNG;
+    ELSIF tonClose.Q THEN
+        iFaultCode := ERR_FB_CLOSED;
+        iStep      := STEP_FAULT;
     END_IF
 
 (* ---------------------------------------------------------------- *)
-SCHRITT_STOERUNG:
-    (* Sicherer Zustand: keine Oeffnungsbefehle, kein Moment.
-       Die Verriegelung bleibt bestehen, bis die Bremse quittiert geschlossen ist. *)
-    xBefehlSB_Oeffnen := FALSE;
-    xBefehlBB_Oeffnen := FALSE;
-    xBypassSB         := FALSE;
-    xBypassBB         := FALSE;
-    xBremstestLaeuft  := FALSE;
-    rDM_Soll          := 0.0;
-    rRpm_Soll         := 0.0;
+STEP_FAULT:
+    (* Stato sicuro: nessun comando di apertura, nessuna coppia.
+       L'interblocco resta finche' il freno non e' chiuso e confermato. *)
+    xOutSB_Open  := FALSE;
+    xOutBB_Open  := FALSE;
+    xBypassSB    := FALSE;
+    xBypassBB    := FALSE;
+    xTestRunning := FALSE;
+    rTorqueSet   := 0.0;
+    rRpmSet      := 0.0;
 
-    IF rtQuittieren.Q THEN
-        IF NOT (xSB_Ist_Zu AND xBB_Ist_Zu) THEN
-            iSchritt := SCHRITT_SCHLIESSEN;          (* zuerst sauber schliessen *)
-        ELSIF xFrg_Gesamt THEN
-            iBremseOffenLatch := BREMSE_KEINE;
-            iStoercode        := ERR_KEIN;
-            xBremstestNOK     := FALSE;
-            iSchritt          := SCHRITT_BEREIT;
+    IF rtrReset.Q THEN
+        IF NOT (xSB_IsClosed AND xBB_IsClosed) THEN
+            iStep := STEP_CLOSING;                  (* prima si chiude in modo pulito *)
+        ELSIF xEn_Overall THEN
+            iBrakeOpenLatch := BRAKE_NONE;
+            iFaultCode      := ERR_NONE;
+            xTestFailed     := FALSE;
+            iStep           := STEP_READY;
         ELSE
-            iStoercode       := ERR_KEIN;
-            xTestBremseAktiv := FALSE;
-            iSchritt         := SCHRITT_GESPERRT;
+            iFaultCode       := ERR_NONE;
+            xBrakeModeActive := FALSE;
+            iStep            := STEP_LOCKED;
         END_IF
     END_IF
 
 ELSE
-    iSchritt := SCHRITT_GESPERRT;
+    iStep := STEP_LOCKED;
 END_CASE
 
 (* ================================================================================
-   F) STATUSBILDUNG
+   F) FORMAZIONE DELLO STATO E LIMITAZIONE DEI SETPOINT
    ================================================================================ *)
-xTestBremseOffen         := xTestBremseAktiv
-                        AND (xBefehlSB_Oeffnen OR xBefehlBB_Oeffnen OR xSB_Ist_Offen OR xBB_Ist_Offen);
-xManuellSchliessenNoetig := (iBremseOffenLatch <> BREMSE_KEINE);
-xAntriebFreigabeTest     := xBremstestLaeuft AND xFrg_Gesamt;
+xBrakeIsOpen         := xBrakeModeActive
+                    AND (xOutSB_Open OR xOutBB_Open OR xSB_IsOpen OR xBB_IsOpen);
+xManualCloseRequired := (iBrakeOpenLatch <> BRAKE_NONE);
+xDriveEnableTest     := xTestRunning AND xEn_Overall;
 
-(* Doppelte Begrenzung der Sollwerte - unabhaengig von der Schrittkette *)
-rDM_Soll    := LIMIT(0.0, rDM_Soll, rDMMaxZulaessig);
-rRpm_Grenze := ABS(rRpmSollTest);
-rRpm_Soll   := LIMIT(-rRpm_Grenze, rRpm_Soll, rRpm_Grenze);
-IF NOT xBremstestLaeuft THEN
-    rDM_Soll  := 0.0;
-    rRpm_Soll := 0.0;
+(* Doppia limitazione dei setpoint, indipendente dalla sequenza a passi *)
+rTorqueSet := LIMIT(0.0, rTorqueSet, rTorqueMax);
+rRpmLimit  := ABS(rRpmTestSetpoint);
+rRpmSet    := LIMIT(-rRpmLimit, rRpmSet, rRpmLimit);
+IF NOT xTestRunning THEN
+    rTorqueSet := 0.0;
+    rRpmSet    := 0.0;
 END_IF
 
 (* ================================================================================
-   G) AUSGABEN AN DIE ANLAGE
+   G) USCITE VERSO L'IMPIANTO
    ================================================================================ *)
 
-(* --- G1: Bypass-Bits fuer die Bremsen-Freigabekette --- *)
+(* --- G1: bit di bypass per la catena di consenso dei freni --- *)
 g_IO.Standbremsentest := xBypassSB;
-(* g_IO.Betriebsbremsentest := xBypassBB; *)   (*TODO*) (* neue Variable in der GVL anlegen und freischalten *)
+(* g_IO.Betriebsbremsentest := xBypassBB; *)   (*TODO*) (* creare la variabile in GVL e abilitare questa riga *)
 
-(* Bestehende Grundregel beibehalten: ohne Service-Mode kein Bremsmodus *)
+(* Regola di base gia' presente: senza Service Mode nessun modo freni *)
 IF NOT g_IO.ServiceMode THEN
     g_IO.Standbremsentest := FALSE;
     (* g_IO.Betriebsbremsentest := FALSE; *)   (*TODO*)
 END_IF
 
-(* --- G2: Bremsenansteuerung ---
-   Nur im Bremsmodus greift dieses PRG auf die Bremsen zu; im Normalbetrieb
-   bleibt die bestehende Ansteuerung unveraendert.
-   TODO: auf die realen Ausgangsvariablen der Bremsen mappen: *)
-IF xTestBremseAktiv THEN
-    (* g_IO.SB_Lueften := xBefehlSB_Oeffnen; *)   (*TODO*)
-    (* g_IO.BB_Lueften := xBefehlBB_Oeffnen; *)   (*TODO*)
+(* --- G2: comando dei freni ---
+   Solo nel modo freni questo PRG interviene sui freni; nel normale
+   funzionamento la gestione esistente resta invariata.
+   TODO: mappare sulle uscite reali di apertura dei freni: *)
+IF xBrakeModeActive THEN
+    (* g_IO.SB_Lueften := xOutSB_Open; *)   (*TODO*)
+    (* g_IO.BB_Lueften := xOutBB_Open; *)   (*TODO*)
     ;
 END_IF
 
-(* --- G3: Antriebssollwerte ---
-   Im Bremsmodus werden Moment und Drehzahl ausschliesslich hier vorgegeben.
-   PRG in der Task NACH der Windensteuerung aufrufen, damit diese Werte gelten. *)
-IF xTestBremseAktiv THEN
-    (*TODO*) (* Typ pruefen: falls Solldrehmoment INT ist -> REAL_TO_INT(rDM_Soll) *)
-    IO_Hauptinverter.Solldrehmoment  := rDM_Soll;
-    IO_Hauptinverter.SollRpmInverter := REAL_TO_INT(LIMIT(-rRpm_Grenze, rRpm_Soll, rRpm_Grenze));
+(* --- G3: setpoint dell'azionamento ---
+   Nel modo freni coppia e giri sono imposti esclusivamente qui.
+   Richiamare il PRG nel task DOPO la gestione winda, cosi' questi valori valgono. *)
+IF xBrakeModeActive THEN
+    (*TODO*) (* verificare il tipo: se Solldrehmoment e' INT -> REAL_TO_INT(rTorqueSet) *)
+    IO_Hauptinverter.Solldrehmoment  := rTorqueSet;
+    IO_Hauptinverter.SollRpmInverter := REAL_TO_INT(LIMIT(-rRpmLimit, rRpmSet, rRpmLimit));
 END_IF
 
 (* ================================================================================
-   H) DIAGNOSETEXTE FUER DIE VISU
+   H) TESTI DI DIAGNOSTICA PER LA VISU
+      I testi restano in tedesco perche' sono destinati all'operatore in impianto;
+      fra parentesi la traduzione italiana.
    ================================================================================ *)
-CASE iSchritt OF
-    SCHRITT_GESPERRT:      sSchrittText := 'Bremsmodus gesperrt';
-    SCHRITT_BEREIT:        sSchrittText := 'Bereit - Bremse und Funktion waehlen';
-    SCHRITT_OEFFNEN:       sSchrittText := 'Bremse wird geoeffnet';
-    SCHRITT_OFFEN:         sSchrittText := 'Bremse OFFEN - Klemmgefahr!';
-    SCHRITT_TEST_RAMPE:    sSchrittText := 'Bremstest - Moment wird aufgebaut';
-    SCHRITT_TEST_HALTEN:   sSchrittText := 'Bremstest - Pruefmoment wird gehalten';
-    SCHRITT_TEST_ABBAU:    sSchrittText := 'Bremstest - Moment wird abgebaut';
-    SCHRITT_SCHLIESSEN:    sSchrittText := 'Bremse manuell schliessen';
-    SCHRITT_STOERUNG:      sSchrittText := 'Stoerung - quittieren';
+CASE iStep OF
+    STEP_LOCKED:         sStepText := 'Bremsmodus gesperrt';                    (* modo freni bloccato              *)
+    STEP_READY:          sStepText := 'Bereit - Bremse und Funktion waehlen';   (* pronto: scegli freno e funzione  *)
+    STEP_OPENING:        sStepText := 'Bremse wird geoeffnet';                  (* apertura del freno in corso      *)
+    STEP_OPEN:           sStepText := 'Bremse OFFEN - Klemmgefahr!';            (* freno APERTO - schiacciamento!   *)
+    STEP_TEST_RAMP:      sStepText := 'Bremstest - Moment wird aufgebaut';      (* prova: salita della coppia       *)
+    STEP_TEST_HOLD:      sStepText := 'Bremstest - Pruefmoment wird gehalten';  (* prova: coppia mantenuta          *)
+    STEP_TEST_RAMPDOWN:  sStepText := 'Bremstest - Moment wird abgebaut';       (* prova: discesa della coppia      *)
+    STEP_CLOSING:        sStepText := 'Bremse manuell schliessen';              (* chiudere il freno manualmente    *)
+    STEP_FAULT:          sStepText := 'Stoerung - quittieren';                  (* anomalia: eseguire il reset      *)
 ELSE
-    sSchrittText := '';
+    sStepText := '';
 END_CASE
 
-CASE iStoercode OF
-    ERR_KEIN:              sStoerText := '';
-    ERR_SERVICEMODE:       sStoerText := 'Service-Mode abgefallen';
-    ERR_USERLEVEL:         sStoerText := 'Userlevel zu niedrig';
-    ERR_NOTAUS:            sStoerText := 'Not-Aus / Pilz nicht ok';
-    ERR_BEIDE_OFFEN:       sStoerText := 'Beide Bremsen offen - unzulaessig!';
-    ERR_BEWEGUNG:          sStoerText := 'Bewegung bei offener Bremse';
-    ERR_MOMENT:            sStoerText := 'Unzulaessiges Moment';
-    ERR_RM_OEFFNEN:        sStoerText := 'Rueckmeldung OFFEN fehlt';
-    ERR_RM_SCHLIESSEN:     sStoerText := 'Rueckmeldung ZU fehlt';
-    ERR_TEST_NOK:          sStoerText := 'Bremstest n.i.O. - Bremse haelt nicht';
-    ERR_ZEIT_OFFEN:        sStoerText := 'Max. Offenzeit ueberschritten';
-    ERR_BETRIEBSART:       sStoerText := 'Betriebsart sperrt den Bremsmodus';
-    ERR_ANTRIEB:           sStoerText := 'Umrichter nicht bereit';
+CASE iFaultCode OF
+    ERR_NONE:            sFaultText := '';
+    ERR_SERVICEMODE:     sFaultText := 'Service-Mode abgefallen';               (* Service Mode caduto              *)
+    ERR_USERLEVEL:       sFaultText := 'Userlevel zu niedrig';                  (* livello utente insufficiente     *)
+    ERR_ESTOP:           sFaultText := 'Not-Aus / Pilz nicht ok';               (* Notaus / Pilz non ok             *)
+    ERR_BOTH_OPEN:       sFaultText := 'Beide Bremsen offen - unzulaessig!';    (* entrambi i freni aperti!         *)
+    ERR_MOVEMENT:        sFaultText := 'Bewegung bei offener Bremse';           (* movimento a freno aperto         *)
+    ERR_TORQUE:          sFaultText := 'Unzulaessiges Moment';                  (* coppia non ammessa               *)
+    ERR_FB_OPEN:         sFaultText := 'Rueckmeldung OFFEN fehlt';              (* manca il feedback APERTO         *)
+    ERR_FB_CLOSED:       sFaultText := 'Rueckmeldung ZU fehlt';                 (* manca il feedback CHIUSO         *)
+    ERR_TEST_FAILED:     sFaultText := 'Bremstest n.i.O. - Bremse haelt nicht'; (* prova fallita: il freno non tiene*)
+    ERR_OPEN_TIMEOUT:    sFaultText := 'Max. Offenzeit ueberschritten';         (* tempo massimo di apertura         *)
+    ERR_OPMODE:          sFaultText := 'Betriebsart sperrt den Bremsmodus';     (* modo operativo incompatibile     *)
+    ERR_DRIVE:           sFaultText := 'Umrichter nicht bereit';                (* inverter non pronto              *)
 ELSE
-    sStoerText := 'Unbekannte Stoerung';
+    sFaultText := 'Unbekannte Stoerung';                                        (* anomalia sconosciuta             *)
 END_CASE
