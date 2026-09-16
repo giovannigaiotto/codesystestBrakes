@@ -1,78 +1,92 @@
-# TestBremse_Controls — comando freni in sicurezza (CODESYS 3.5.18.4)
+# TestBremse_Controls — apertura forzata dei freni (CODESYS 3.5.18.4)
 
-`POUs/TestBremse_Controls.st` — PROGRAM (PRG) in Structured Text per:
+`POUs/TestBremse_Controls.st` — PRG in Structured Text, **versione minima da banco**:
+apre **un solo** freno della winda in Service Mode e obbliga a richiuderlo
+manualmente prima di poter aprire l'altro. Niente altro.
 
-1. **Controllo del traferro (Lüftspalt)**: apertura di **un solo** freno, mentre l'altro tiene la winda.
-2. **Prova freni (Bremstest)**: coppia rampata contro il freno chiuso, con sorveglianza dello slittamento.
+SB = Standbremse = freno di stazionamento · BB = Betriebsbremse = freno di servizio.
 
-Convenzione adottata: **identificatori interni in inglese**, commenti e descrizioni in italiano.
-Restano in tedesco solo i nomi già esistenti nel progetto (`g_IO.Standbremsentest`, `SBoffen`,
-`BBzu`, `IOPilzWinde.K_NAok_VZ`, …) e i testi di stato mostrati all'operatore in impianto,
-che hanno la traduzione italiana come commento a fianco.
+## Variabili che ENTRANO nel PRG
 
-Sigle dei freni, mantenute perché corrispondono all'I/O reale:
-**SB** = Standbremse = freno di stazionamento · **BB** = Betriebsbremse = freno di servizio.
+| Variabile | Sorgente | Significato |
+|---|---|---|
+| `in_ServiceMode` | `g_IO.ServiceMode` | chiave di Service Mode |
+| `in_UserLevel` | `CurrentUserLevel` *(TODO)* | livello utente, serve ≥ `MinUserLevel` (= 2) |
+| `in_NAok` | `IOPilzWinde.K_NAok_VZ` | Notaus / Pilz ok |
+| `in_Rpm` | `IO_Hauptinverter.ActualSpeed` *(TODO)* | giri/min, serve ≤ `RpmStandstill` (= 2.0) |
+| `in_SBoffen` / `in_BBoffen` | `g_IO.SBoffen` / `g_IO.BBoffen` | feedback "freno aperto" |
+| `CmdOpenSB` / `CmdOpenBB` / `CmdClose` | visu, pulsanti a impulso | apri SB / apri BB / chiudi |
+| `simOn`, `simSBoffen`, `simBBoffen` | solo banco | sovrascrivono i due feedback |
 
-## Punti chiave implementati (richiesta della direzione tecnica)
+## Variabili che ESCONO dal PRG
 
-| Richiesta | Implementazione |
+| Variabile | Destinazione | Significato |
+|---|---|---|
+| `OutSB_Open` / `OutBB_Open` | uscite freni *(TODO: mappare)* | comando di apertura |
+| `EnableOk` | visu | consenso generale, condizione **permanente** |
+| `enOpenSB` / `enOpenBB` | visu | abilitazione dei pulsanti di apertura |
+| `enClose` | visu | abilitazione del pulsante di chiusura |
+| `ManualCloseRequired` | visu | interblocco attivo: il freno va ancora richiuso |
+
+Interne: `brakeCmd` (freno comandato aperto 0/1/2) e `brakeLatch` (interblocco 0/1/2).
+
+## Logica in quattro righe
+
+```
+EnableOk := ServiceMode AND (UserLevel >= 2) AND NAok AND (ABS(Rpm) <= RpmStandstill);
+enOpenSB := EnableOk AND (brakeLatch = 0) AND entrambi i feedback "aperto" caduti;
+apertura  -> brakeCmd := 1|2 e brakeLatch := 1|2
+chiusura  -> brakeCmd := 0; brakeLatch cade SOLO quando il feedback "aperto" e' caduto
+```
+
+Se `EnableOk` cade (Service Mode, livello, Notaus, movimento) oppure risultano aperti
+tutti e due i freni, il comando viene tolto subito e il freno chiude a molla.
+L'interblocco **resta**: l'altro freno non si apre finché il primo non è chiuso davvero.
+
+## Requisiti coperti
+
+| Richiesta | Dove |
 |---|---|
-| Service Mode | `xEn_ServiceMode := g_IO.ServiceMode` — condizione **permanente**, non solo di ingresso |
-| Livello utente 2 | `xEn_UserLevel := (iUserLevel >= MIN_USERLEVEL)`, con `MIN_USERLEVEL = 2` |
-| Prova freni | passi `STEP_TEST_RAMP / _HOLD / _RAMPDOWN`, con rampa, tempo di mantenimento e criterio di slittamento (giri/min + giri integrati) |
-| Un solo freno aperto | interblocco `iBrakeOpenLatch` (0 / SB / BB): finché è diverso da zero nessuna apertura è possibile |
-| Chiusura manuale obbligatoria | l'interblocco si sblocca **solo** in `STEP_CLOSING` e solo con il feedback "chiuso" presente |
-| Notaus sempre attivo | `IOPilzWinde.K_NAok_VZ` è condizione permanente: se cade, interruzione immediata |
-| Nessuna coppia o velocità pericolosa | sorveglianze D1…D5: fermo macchina, coppia libera, movimento a freno aperto, coppia massima, tempo massimo di apertura |
+| Service Mode | `in_ServiceMode` in `EnableOk` (permanente) |
+| Livello utente 2 | `in_UserLevel >= MinUserLevel` |
+| Notaus sempre attivo | `in_NAok` in `EnableOk` (permanente) |
+| Un solo freno aperto | `brakeLatch` + `enOpenSB` / `enOpenBB` |
+| Richiusura manuale obbligatoria | `brakeLatch` cade solo con comando tolto e feedback "aperto" caduto |
+| Descrizione del rischio | `doc/Betriebsanleitung_Bremsentest.md` |
 
-Il programma **non** scavalca nessuna funzione di sicurezza: l'interblocco sicuro
-(un solo freno aperto, Notaus, sorveglianza di fermo macchina, limitazione sicura della
-coppia) resta da realizzare nel **Pilz**. Questo PRG è il livello funzionale e la guida operatore.
+## Volutamente NON presente
 
-## Integrazione in 5 passi
+Prova freni (coppia rampata, slittamento, esito i.O./n.i.O.), controllo traferro come
+funzione separata, codici di anomalia, testi di stato, timer di sorveglianza, conferma
+del pericolo, scrittura dei setpoint dell'inverter. Il PRG **non tocca**
+`IO_Hauptinverter`: nessuna coppia viene imposta. Il controllo vero resta nel PILZ.
+Il Bremstest si aggiunge come secondo blocco quando questa parte è provata al banco
+(la versione completa resta nella storia git, commit `f4e84e3`).
 
-1. **Richiamo nel task**: chiamare `TestBremse_Controls` **dopo** la normale gestione winda,
-   così i setpoint forzati a zero sono gli ultimi scritti.
-2. **Rimuovere il vecchio blocco** `IF g_io.Standbremsentest THEN IO_Hauptinverter.Solldrehmoment := …`:
-   la scrittura dei setpoint ora avviene solo qui.
-3. **Nuova variabile in GVL**: `Betriebsbremsentest : BOOL;` e catena di consenso estesa:
-   ```
-   g_IO.AlleBremsenoffen := (g_IO.SBoffen OR g_IO.Standbremsentest)
-                        AND (g_IO.BBoffen OR g_IO.Betriebsbremsentest);
-   ```
-   Poi togliere il commento alle due righe `(*TODO*)` di `g_IO.Betriebsbremsentest` nella sezione G.
-4. **Righe `(*TODO*)`**: sono le uniche interfacce da adattare ai nomi e ai tipi reali
-   (valore reale giri e coppia, segnale di pronto dell'inverter, feedback `SBzu`,
-   uscite di apertura dei freni, sorgente del livello utente, tipo di `Solldrehmoment`).
-5. **Parametri**: `rTorqueTestSB`, `rTorqueTestBB` e `rTorqueMax` partono da **0.0**, quindi la
-   prova freni resta bloccata finché non vengono tarati (scelta voluta).
-   Allineare anche `CYCLE_MS` al tempo di ciclo del task: serve per la rampa e per
-   l'integrazione dello slittamento.
+## Integrazione
 
-## Visualizzazione
+1. Richiamare il PRG nel task **dopo** la normale gestione winda.
+2. Togliere il commento alle due righe `g_IO.SB_Lueften` / `g_IO.BB_Lueften` con i nomi reali.
+3. Verificare nome e tipo di giri reali e livello utente (righe `(*TODO*)`).
+4. Se nel progetto esistono i feedback "chiuso" (`SBzu` / `BBzu`), usare quelli al posto
+   della negazione di "aperto": con un sensore rotto i due segnali non sono coerenti.
 
-I pulsanti scrivono direttamente su `TestBremse_Controls.xCmd…` (tipo "a impulso", fronte di salita).
-Mantenere i blocchi già presenti e aggiungere l'abilitazione dinamica:
+## Visu
 
-| Elemento | Blocco / abilitazione |
-|---|---|
-| Ingresso pagina | `NOT (g_IO.ServiceMode AND PLC_PRG.userlevel3)` |
-| Tutti i pulsanti | `((IOPilzWinde.K_NAok_VZ) AND (g_IO.ServiceMode) AND (CurrentUserLevel>=2)) = FALSE` |
-| "Apri freno" | in più: `NOT TestBremse_Controls.xEn_Open` |
-| "Avvia prova freni" | in più: `NOT TestBremse_Controls.xEn_TestStart` |
-| Testo di stato | `TestBremse_Controls.sStepText` / `.sFaultText` |
-| Avviso permanente | `TestBremse_Controls.xManualCloseRequired` ⇒ "Bremse manuell schliessen!" |
+Blocco già presente sulla pagina, da mantenere:
+`((IOPilzWinde.K_NAok_VZ) AND (g_IO.ServiceMode) AND (CurrentUserLevel>=2)) = FALSE`.
+In più sui pulsanti: "apri SB" ⇒ `NOT enOpenSB`, "apri BB" ⇒ `NOT enOpenBB`,
+"chiudi" ⇒ `NOT enClose`. Avviso fisso se `ManualCloseRequired`.
 
-## Prove consigliate prima della messa in servizio
+## Prove al banco
 
-* In simulazione: aprire SB e verificare che "apri BB" resti bloccato finché SB non è chiusa manualmente.
-* Notaus con un freno aperto ⇒ il comando di apertura cade, l'interblocco resta, stato `STEP_FAULT`.
-* Chiave di Service Mode riportata indietro durante la prova ⇒ coppia a zero e freni chiusi.
-* Feedback "aperto" / "chiuso" tolto ⇒ `ERR_FB_OPEN` / `ERR_FB_CLOSED`.
-* Prova freni con un freno volutamente mal regolato ⇒ esito `n.i.O.` senza corsa incontrollata.
+* `simOn := TRUE`, apri SB ⇒ `OutSB_Open` TRUE, `enOpenBB` FALSE.
+* Con SB ancora aperta premi "chiudi" ⇒ comando via, ma `enOpenBB` resta FALSE
+  finché `simSBoffen` non torna FALSE.
+* Togli Service Mode / Notaus / muovi la winda con un freno aperto ⇒ comando via subito.
 
 ## Documentazione
 
-`doc/Betriebsanleitung_Bremsentest.md` — bozza del capitolo di manuale d'uso, in tedesco perché
-destinata all'impianto: procedura passo passo, avvertenze di pericolo (schiacciamento,
-scarico della winda, recupero del tiro sulla fune) e tabella delle anomalie.
+`doc/Betriebsanleitung_Bremsentest.md` — bozza del capitolo di manuale (in tedesco):
+procedura, pericolo di schiacciamento, scarico della winda, controllo del traferro.
+Descrive la funzione completa, quindi anche il Bremstest non ancora implementato.
