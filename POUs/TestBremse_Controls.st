@@ -14,13 +14,26 @@
    * winda ferma e azionamento scarico (giri e coppia reale sorvegliati)
    * prima si attiva il modo ManualTestBremse (status verso il PILZ), poi si apre
    * un solo freno aperto per volta
-   * se all'ingresso nel modo un freno risulta gia' aperto, e' quello che va
-     richiuso per primo: nessun altro freno si apre finche' non e' chiuso
-   * il freno aperto va richiuso MANUALMENTE (pulsante) e il feedback "chiuso"
-     deve essere stabile per tSettle (5 s) prima che l'altro freno sia apribile
+   * il freno aperto va richiuso MANUALMENTE (pulsante) e i due feedback "aperto"
+     devono essere caduti da tSettle (5 s) prima che l'altro freno sia apribile
 
-   TEMPI  (tSettle = 5 s, una sola manopola per apertura e chiusura)
-   -----------------------------------------------------------------
+   DUE COSE DIVERSE, DA NON CONFONDERE
+   -----------------------------------
+   brakeCmd     = cosa sto COMANDANDO io da questa pagina (0 / 1 SB / 2 BB).
+                  Solo questo diventa OutSB_Open / OutBB_Open.
+   brakeOpenFb  = cosa SI VEDE in impianto dai feedback (0 / 1 SB / 2 BB / 3 entrambi).
+                  E' solo uno stato: questo PRG non puo' chiudere un freno che non
+                  ha aperto lui. Se brakeOpenFb <> 0 con brakeCmd = 0 si accende
+                  WarnOpenExtern: o lo tiene aperto la gestione winda, o il
+                  feedback non e' coerente (cablaggio / polarita' da verificare).
+
+   INTERBLOCCO
+   -----------
+   E' BothClosedOk: comando tolto E nessun feedback "aperto", stabile per tSettle.
+   Finche' e' FALSE non si apre niente. E' questa la chiusura manuale obbligatoria.
+
+   TEMPI  (tSettle = 5 s, uno solo per apertura e chiusura)
+   -------------------------------------------------------
    entrambi chiusi -> apro BB -> 5 s -> BrakeOpenOk
                    -> chiudo  -> 5 s -> BothClosedOk -> entrambi chiusi, si riparte
 
@@ -66,12 +79,13 @@ VAR
     enOpenSB            : BOOL;         (* TRUE = pulsante "apri SB" ammesso          *)
     enOpenBB            : BOOL;         (* TRUE = pulsante "apri BB" ammesso          *)
     enClose             : BOOL;         (* TRUE = pulsante "chiudi" ammesso           *)
-    brakeOpen           : INT := 0;     (* quale freno e' aperto: 0 / 1 SB / 2 BB     *)
-    BrakeOpenOk         : BOOL;         (* freno aperto e feedback stabile da 5 s     *)
-    BothClosedOk        : BOOL;         (* entrambi chiusi e feedback stabile da 5 s  *)
-    ManualCloseRequired : BOOL;         (* interblocco attivo: richiudere il freno    *)
+    brakeOpenFb         : INT := 0;     (* STATO dai feedback: 0 / 1 SB / 2 BB / 3 entrambi *)
+    BrakeOpenOk         : BOOL;         (* freno aperto da me e feedback presente dopo 5 s  *)
+    BothClosedOk        : BOOL;         (* INTERBLOCCO LIBERO: tutti chiusi da 5 s    *)
+    ManualCloseRequired : BOOL;         (* un freno risulta aperto: va richiuso       *)
     FaultBothOpen       : BOOL;         (* ANOMALIA: risultano aperti tutti e due     *)
     WarnNoFeedback      : BOOL;         (* dopo 5 s manca il feedback "aperto"        *)
+    WarnOpenExtern      : BOOL;         (* freno aperto SENZA comando da questa pagina*)
 
     (* --- 5) PARAMETRI --- *)
     RpmStandstill       : REAL := 2.0;    (* giri/min ammessi: winda ferma            *)
@@ -108,8 +122,18 @@ EnableOk := in_ServiceMode
         AND (ABS(in_Rpm) <= RpmStandstill)
         AND (ABS(in_Torque) <= TorqueFreeLimit);
 
-(* ---- 3) STATO DEI FRENI E TEMPI ----------------------------------------------- *)
-FaultBothOpen := in_SBoffen AND in_BBoffen;         (* stato non ammesso *)
+(* ---- 3) STATO DEI FRENI DAL FEEDBACK E TEMPI ---------------------------------- *)
+(* Solo fotografia dell'impianto, nessun comando e nessuna memoria *)
+IF in_SBoffen AND in_BBoffen THEN
+    brakeOpenFb := 3;                               (* 3 = tutti e due, non ammesso *)
+ELSIF in_SBoffen THEN
+    brakeOpenFb := 1;                               (* 1 = SB *)
+ELSIF in_BBoffen THEN
+    brakeOpenFb := 2;                               (* 2 = BB *)
+ELSE
+    brakeOpenFb := 0;                               (* 0 = tutti e due chiusi *)
+END_IF
+FaultBothOpen := (brakeOpenFb = 3);
 
 (* 5 s dal comando di apertura: dopo questo tempo il feedback deve esserci *)
 tonOpen(IN := (brakeCmd <> 0), PT := tSettle);
@@ -117,46 +141,43 @@ BrakeOpenOk    := tonOpen.Q AND (((brakeCmd = 1) AND in_SBoffen)
                               OR ((brakeCmd = 2) AND in_BBoffen));
 WarnNoFeedback := tonOpen.Q AND NOT BrakeOpenOk;
 
-(* 5 s con comando tolto e nessun feedback "aperto": e' la chiusura confermata *)
-tonClosed(IN := (brakeCmd = 0) AND NOT in_SBoffen AND NOT in_BBoffen, PT := tSettle);
+(* INTERBLOCCO: comando tolto e nessun feedback "aperto", stabile per 5 s.
+   Finche' e' FALSE non si apre niente: e' la chiusura manuale obbligatoria. *)
+tonClosed(IN := (brakeCmd = 0) AND (brakeOpenFb = 0), PT := tSettle);
 BothClosedOk := tonClosed.Q;
 
-(* INTERBLOCCO: segue il feedback reale, cosi' un freno gia' aperto all'ingresso
-   nel modo e' il primo da richiudere. Si sblocca solo con BothClosedOk. *)
-IF in_SBoffen THEN
-    brakeOpen := 1;                                 (* 1 = SB *)
-ELSIF in_BBoffen THEN
-    brakeOpen := 2;                                 (* 2 = BB *)
-ELSIF (brakeCmd = 0) AND BothClosedOk THEN
-    brakeOpen := 0;                                 (* 0 = entrambi chiusi, interblocco libero *)
-END_IF
+(* Freno aperto che NON ho aperto io: da questa pagina non si chiude.
+   Verificare la gestione winda e la coerenza del feedback "offen". *)
+WarnOpenExtern      := (brakeOpenFb <> 0) AND (brakeCmd = 0);
+ManualCloseRequired := (brakeOpenFb <> 0);
 
 (* ---- 4) MODO MANUAL TEST BREMSE ----------------------------------------------- *)
 rtrTestOn(CLK := CmdTestOn);
 rtrTestOff(CLK := CmdTestOff);
 
-(* Nel modo si entra anche con un freno gia' aperto: e' quello che va richiuso
-   per primo, l'interblocco (sezione 3) non lascia aprire nient'altro. *)
+(* Nel modo si entra anche con un freno gia' aperto: l'interblocco BothClosedOk
+   non lascia comunque aprire niente finche' quel freno non e' chiuso. *)
 IF rtrTestOn.Q AND EnableOk THEN
     ManualTestBremse := TRUE;
 END_IF
 
-(* Dal modo si esce solo con tutti e due i freni chiusi e confermati *)
-IF (rtrTestOff.Q OR NOT EnableOk) AND (brakeOpen = 0) AND (brakeCmd = 0) THEN
+(* Si esce dal modo quando questa pagina non comanda piu' nessuna apertura.
+   Un freno tenuto aperto da altri non deve incastrare l'operatore qui dentro. *)
+IF (rtrTestOff.Q OR NOT EnableOk) AND (brakeCmd = 0) THEN
     ManualTestBremse := FALSE;
 END_IF
 
 (* ---- 5) CONSENSI DEI PULSANTI (li legge la visu) ------------------------------ *)
 enTestOn  := EnableOk AND NOT ManualTestBremse;
-enTestOff := ManualTestBremse AND (brakeOpen = 0) AND (brakeCmd = 0);
+enTestOff := ManualTestBremse AND (brakeCmd = 0);
 
-(* Si apre solo con: modo attivo, consenso ok, nessun freno aperto da 5 s *)
-enOpenSB := ManualTestBremse AND EnableOk AND (brakeCmd = 0)
-        AND (brakeOpen = 0) AND BothClosedOk;
-enOpenBB := ManualTestBremse AND EnableOk AND (brakeCmd = 0)
-        AND (brakeOpen = 0) AND BothClosedOk;
+(* Si apre solo con: modo attivo, consenso ok, niente comandato,
+   e interblocco libero (tutti e due i freni chiusi da 5 s) *)
+enOpenSB := ManualTestBremse AND EnableOk AND (brakeCmd = 0) AND BothClosedOk;
+enOpenBB := ManualTestBremse AND EnableOk AND (brakeCmd = 0) AND BothClosedOk;
 
-enClose := ManualTestBremse AND ((brakeCmd <> 0) OR (brakeOpen <> 0));
+(* Il pulsante "chiudi" ha senso solo su un freno aperto da questa pagina *)
+enClose := ManualTestBremse AND (brakeCmd <> 0);
 
 (* ---- 6) COMANDI SUL FRONTE DI SALITA ------------------------------------------ *)
 rtrOpenSB(CLK := CmdOpenSB);
@@ -164,13 +185,11 @@ rtrOpenBB(CLK := CmdOpenBB);
 rtrClose(CLK := CmdClose);
 
 IF rtrOpenSB.Q AND enOpenSB THEN
-    brakeCmd  := 1;                                 (* 1 = SB *)
-    brakeOpen := 1;                                 (* interblocco subito, senza aspettare il feedback *)
+    brakeCmd := 1;                                  (* 1 = SB *)
 END_IF
 
 IF rtrOpenBB.Q AND enOpenBB THEN
-    brakeCmd  := 2;                                 (* 2 = BB *)
-    brakeOpen := 2;
+    brakeCmd := 2;                                  (* 2 = BB *)
 END_IF
 
 IF rtrClose.Q THEN
@@ -187,8 +206,6 @@ END_IF
 (* ---- 8) USCITE ---------------------------------------------------------------- *)
 OutSB_Open := (brakeCmd = 1);
 OutBB_Open := (brakeCmd = 2);
-
-ManualCloseRequired := ManualTestBremse AND (brakeOpen <> 0);
 
 (* g_IO.SB_Lueften        := OutSB_Open;       *)   (*TODO*) (* uscita reale SB      *)
 (* g_IO.BB_Lueften        := OutBB_Open;       *)   (*TODO*) (* uscita reale BB      *)

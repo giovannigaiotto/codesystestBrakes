@@ -28,14 +28,21 @@ SB = Standbremse = freno di stazionamento · BB = Betriebsbremse = freno di serv
 | `EnableOk` | visu | consenso generale, condizione **permanente** |
 | `enTestOn` / `enTestOff` | visu | abilitazione dei pulsanti di modo |
 | `enOpenSB` / `enOpenBB` / `enClose` | visu | abilitazione dei pulsanti di apertura e chiusura |
-| `brakeOpen` | visu | quale freno è aperto: 0 nessuno / 1 SB / 2 BB (**interblocco**) |
-| `BrakeOpenOk` | visu | freno aperto con feedback stabile da 5 s |
-| `BothClosedOk` | visu | tutti e due chiusi con feedback stabile da 5 s |
-| `ManualCloseRequired` | visu | il freno aperto va ancora richiuso a mano |
+| `brakeOpenFb` | visu | **stato dai feedback**: 0 nessuno / 1 SB / 2 BB / 3 entrambi |
+| `BrakeOpenOk` | visu | freno aperto da qui, feedback presente dopo 5 s |
+| `BothClosedOk` | visu | **interblocco libero**: tutti e due chiusi da 5 s |
+| `ManualCloseRequired` | visu | un freno risulta aperto: va richiuso |
 | `FaultBothOpen` | visu | anomalia: risultano aperti tutti e due |
 | `WarnNoFeedback` | visu | dopo 5 s manca il feedback "aperto" |
+| `WarnOpenExtern` | visu | freno aperto **senza comando da questa pagina** |
 
 Interna: `brakeCmd` (quale freno sto comandando aperto, 0/1/2).
+
+**`brakeCmd` e `brakeOpenFb` sono due cose diverse**: il primo è quello che comando io
+e diventa `OutSB_Open` / `OutBB_Open`; il secondo è solo quello che vedo in impianto.
+Questo PRG non può chiudere un freno che non ha aperto lui: se `brakeOpenFb <> 0` con
+`brakeCmd = 0` si accende `WarnOpenExtern` — o lo tiene aperto la gestione winda, o il
+feedback "offen" non è coerente (cablaggio / polarità da verificare).
 Parametri: `RpmStandstill`, `TorqueFreeLimit`, `MinUserLevel`, `tSettle` (= T#5S).
 
 ## Sequenza
@@ -44,20 +51,22 @@ Parametri: `RpmStandstill`, `TorqueFreeLimit`, `MinUserLevel`, `tSettle` (= T#5S
 EnableOk = ServiceMode AND UserLevel>=2 AND NAok AND fermo AND scarico   (permanente)
 
   CmdTestOn -> ManualTestBremse = TRUE            (status al PILZ)
-  entrambi chiusi da 5 s (BothClosedOk) -> enOpenSB / enOpenBB
-  CmdOpenBB -> OutBB_Open = TRUE, brakeOpen = 2   (interblocco: SB non si apre piu')
+  BothClosedOk (tutti chiusi da 5 s) -> enOpenSB / enOpenBB
+  CmdOpenBB -> OutBB_Open = TRUE, brakeCmd = 2    (BothClosedOk cade: SB non si apre)
   5 s -> BrakeOpenOk                              (senza feedback: WarnNoFeedback)
   CmdClose  -> OutBB_Open = FALSE, il freno chiude a molla
-  feedback "aperto" caduto + 5 s -> BothClosedOk, brakeOpen = 0
-  CmdTestOff -> ManualTestBremse = FALSE          (solo con brakeOpen = 0)
+  feedback "aperto" caduto + 5 s -> BothClosedOk -> si puo' aprire l'altro
+  CmdTestOff -> ManualTestBremse = FALSE          (solo con brakeCmd = 0)
 ```
 
-`brakeOpen` segue il **feedback reale**: se all'ingresso nel modo un freno è già aperto,
-si entra lo stesso ma è quello che va richiuso per primo, e nessun altro freno si apre.
+L'interblocco è `BothClosedOk` e basta: comando tolto **e** nessun feedback "aperto",
+stabile per 5 s. Se all'ingresso nel modo un freno è già aperto, si entra lo stesso ma
+non si apre niente finché quello non è chiuso (`ManualCloseRequired`, `WarnOpenExtern`).
 
 Se `EnableOk` cade (Service Mode, livello, Notaus, movimento, coppia), se il modo viene
-tolto o se risultano aperti tutti e due i freni, il comando cade subito. L'interblocco
-`brakeOpen` **resta**, e finché non è a zero non si esce nemmeno dal modo.
+tolto o se risultano aperti tutti e due i freni, il comando cade subito. Dal modo si esce
+quando questa pagina non comanda più nessuna apertura: un freno tenuto aperto da altri
+non deve incastrare l'operatore dentro il modo.
 
 ## Requisiti coperti
 
@@ -67,8 +76,8 @@ tolto o se risultano aperti tutti e due i freni, il comando cade subito. L'inter
 | Livello utente 2 | `in_UserLevel >= MinUserLevel` |
 | Notaus sempre attivo | `in_NAok` in `EnableOk` (permanente) |
 | Winda ferma / azionamento scarico | `in_Rpm` e `in_Torque` in `EnableOk` (permanente) |
-| Un solo freno aperto | `brakeOpen` + `enOpenSB` / `enOpenBB` |
-| Richiusura manuale obbligatoria | `brakeOpen` cade solo con `BothClosedOk` (5 s) |
+| Un solo freno aperto | `BothClosedOk` in `enOpenSB` / `enOpenBB` |
+| Richiusura manuale obbligatoria | `BothClosedOk` arriva solo 5 s dopo la caduta dei feedback |
 | Status verso il PILZ | `ManualTestBremse` |
 | Descrizione del rischio | `doc/Betriebsanleitung_Bremsentest.md` |
 
@@ -100,9 +109,12 @@ In più sui pulsanti: `NOT enTestOn`, `NOT enTestOff`, `NOT enOpenSB`, `NOT enOp
 
 * Entrambi chiusi ⇒ attiva il modo, apri BB, dopo 5 s `BrakeOpenOk`; `enOpenSB` resta FALSE.
 * Premi "chiudi": `enOpenSB` torna TRUE solo 5 s dopo la caduta di `g_IO.BBoffen`.
-* Togli Service Mode / Notaus, o muovi la winda con un freno aperto ⇒ comando via subito,
-  `brakeOpen` resta e il modo non si lascia.
-* Entra nel modo con un freno già aperto ⇒ nessuna apertura ammessa, `ManualCloseRequired`.
+* Togli Service Mode / Notaus, o muovi la winda con un freno aperto ⇒ comando via subito.
+* Entra nel modo con un freno già aperto ⇒ nessuna apertura ammessa,
+  `ManualCloseRequired` e `WarnOpenExtern` accesi, uscita dal modo comunque possibile.
+* `brakeOpenFb <> 0` con la winda ferma e i freni visibilmente chiusi ⇒ il feedback
+  `g_IO.SBoffen` / `g_IO.BBoffen` non è coerente: controllare cablaggio e polarità
+  prima di andare avanti, tutto l'interblocco si appoggia su quei due bit.
 
 ## Documentazione
 
