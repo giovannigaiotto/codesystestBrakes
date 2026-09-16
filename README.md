@@ -1,10 +1,29 @@
-# TestBremse_Controls — apertura forzata dei freni (CODESYS 3.5.18.4)
+# TestBremse_Controls — comando manuale dei freni (CODESYS 3.5.18.4)
 
-`POUs/TestBremse_Controls.st` — PRG in Structured Text: apre **un solo** freno della
-winda in Service Mode, dentro il modo `ManualTestBremse` che viene mandato al PILZ.
-Nessuna prova freni, nessuna coppia imposta.
+`POUs/TestBremse_Controls.st` — PRG in Structured Text: **apre e chiude a mano** i due
+freni della winda in Service Mode, uno per volta, dentro il modo `ManualTestBremse`
+che viene mandato al PILZ. Nessuna prova freni, nessuna coppia imposta.
 
 SB = Standbremse = freno di stazionamento · BB = Betriebsbremse = freno di servizio.
+
+## Nel modo i freni li comanda questo PRG
+
+Finché `ManualTestBremse` è TRUE, le uscite dei freni le scrive questo PRG **tutti i
+cicli, anche a FALSE**. È l'unica cosa che permette di **chiudere** un freno che si
+trova già aperto quando si entra nella pagina. Fuori dal modo le uscite restano alla
+gestione winda, che non viene toccata.
+
+Perché funzioni servono due cose:
+1. richiamare il PRG nel task **dopo** la gestione winda;
+2. collegare le uscite reali nelle righe `(*TODO*)` della sezione 8 — **finché sono
+   commentate nessun pulsante muove niente in impianto**.
+
+```
+IF ManualTestBremse THEN
+    g_IO.SB_Lueften := OutSB_Open;      (* nome reale da mettere *)
+    g_IO.BB_Lueften := OutBB_Open;      (* nome reale da mettere *)
+END_IF
+```
 
 ## Variabili che ENTRANO nel PRG
 
@@ -17,66 +36,66 @@ SB = Standbremse = freno di stazionamento · BB = Betriebsbremse = freno di serv
 | `in_Torque` | `IO_Hauptinverter.ActualDM` | coppia reale, serve ≤ `TorqueFreeLimit` (= 50.0) |
 | `in_SBoffen` / `in_BBoffen` | `g_IO.SBoffen` / `g_IO.BBoffen` | feedback "freno aperto" |
 | `CmdTestOn` / `CmdTestOff` | visu, pulsanti a impulso | entra / esci dal modo |
-| `CmdOpenSB` / `CmdOpenBB` / `CmdClose` | visu, pulsanti a impulso | apri SB / apri BB / chiudi |
+| `CmdOpenSB` / `CmdCloseSB` | visu, pulsanti a impulso | apri SB / chiudi SB |
+| `CmdOpenBB` / `CmdCloseBB` | visu, pulsanti a impulso | apri BB / chiudi BB |
 
 ## Variabili che ESCONO dal PRG
 
 | Variabile | Destinazione | Significato |
 |---|---|---|
-| `ManualTestBremse` | **PILZ** *(TODO: mappare)* | status del modo di apertura manuale |
+| `ManualTestBremse` | **PILZ** *(TODO: mappare)* | status del modo manuale |
 | `OutSB_Open` / `OutBB_Open` | uscite freni *(TODO: mappare)* | comando di apertura |
 | `EnableOk` | visu | consenso generale, condizione **permanente** |
 | `enTestOn` / `enTestOff` | visu | abilitazione dei pulsanti di modo |
-| `enOpenSB` / `enOpenBB` / `enClose` | visu | abilitazione dei pulsanti di apertura e chiusura |
+| `enOpenSB` / `enOpenBB` | visu | abilitazione dei pulsanti di apertura |
+| `enCloseSB` / `enCloseBB` | visu | abilitazione dei pulsanti di chiusura |
 | `brakeOpenFb` | visu | **stato dai feedback**: 0 nessuno / 1 SB / 2 BB / 3 entrambi |
 | `BrakeOpenOk` | visu | freno aperto da qui, feedback presente dopo 5 s |
 | `BothClosedOk` | visu | **interblocco libero**: tutti e due chiusi da 5 s |
 | `ManualCloseRequired` | visu | un freno risulta aperto: va richiuso |
 | `FaultBothOpen` | visu | anomalia: risultano aperti tutti e due |
 | `WarnNoFeedback` | visu | dopo 5 s manca il feedback "aperto" |
-| `WarnOpenExtern` | visu | freno aperto **senza comando da questa pagina** |
+| `WarnOpenExtern` | visu | freno aperto **mentre non comando niente** |
 
-Interna: `brakeCmd` (quale freno sto comandando aperto, 0/1/2).
+Interne: `cmdSB_Open` / `cmdBB_Open` (cosa comando io, mai tutte e due insieme).
 
-**`brakeCmd` e `brakeOpenFb` sono due cose diverse**: il primo è quello che comando io
-e diventa `OutSB_Open` / `OutBB_Open`; il secondo è solo quello che vedo in impianto.
-Questo PRG non può chiudere un freno che non ha aperto lui: se `brakeOpenFb <> 0` con
-`brakeCmd = 0` si accende `WarnOpenExtern` — o lo tiene aperto la gestione winda, o il
-feedback "offen" non è coerente (cablaggio / polarità da verificare).
-Parametri: `RpmStandstill`, `TorqueFreeLimit`, `MinUserLevel`, `tSettle` (= T#5S).
+**`cmd…` e `brakeOpenFb` sono due cose diverse**: il primo è quello che comando io e
+diventa `OutSB_Open` / `OutBB_Open`; il secondo è solo quello che vedo in impianto.
+`WarnOpenExtern` accende la differenza: uscite non ancora collegate (righe TODO), freno
+tenuto aperto da altri, o feedback `offen` non coerente.
 
-## Sequenza
+## Sequenza, partendo dal caso tipico SB aperta / BB chiusa
 
 ```
 EnableOk = ServiceMode AND UserLevel>=2 AND NAok AND fermo AND scarico   (permanente)
 
-  CmdTestOn -> ManualTestBremse = TRUE            (status al PILZ)
-  BothClosedOk (tutti chiusi da 5 s) -> enOpenSB / enOpenBB
-  CmdOpenBB -> OutBB_Open = TRUE, brakeCmd = 2    (BothClosedOk cade: SB non si apre)
-  5 s -> BrakeOpenOk                              (senza feedback: WarnNoFeedback)
-  CmdClose  -> OutBB_Open = FALSE, il freno chiude a molla
-  feedback "aperto" caduto + 5 s -> BothClosedOk -> si puo' aprire l'altro
-  CmdTestOff -> ManualTestBremse = FALSE          (solo con brakeCmd = 0)
+CmdTestOn  -> ManualTestBremse = TRUE, comandi a zero -> la SB viene comandata chiusa
+feedback SB caduto + 5 s -> BothClosedOk -> enOpenSB / enOpenBB
+CmdOpenBB  -> OutBB_Open = TRUE          (BothClosedOk cade: la SB non si apre)
+5 s        -> BrakeOpenOk                (senza feedback: WarnNoFeedback)
+CmdCloseBB -> OutBB_Open = FALSE, il freno chiude a molla
+feedback BB caduto + 5 s -> BothClosedOk -> si può aprire l'altro
+CmdTestOff -> ManualTestBremse = FALSE, uscite di nuovo alla gestione winda
 ```
 
-L'interblocco è `BothClosedOk` e basta: comando tolto **e** nessun feedback "aperto",
-stabile per 5 s. Se all'ingresso nel modo un freno è già aperto, si entra lo stesso ma
-non si apre niente finché quello non è chiuso (`ManualCloseRequired`, `WarnOpenExtern`).
-
-Se `EnableOk` cade (Service Mode, livello, Notaus, movimento, coppia), se il modo viene
-tolto o se risultano aperti tutti e due i freni, il comando cade subito. Dal modo si esce
-quando questa pagina non comanda più nessuna apertura: un freno tenuto aperto da altri
-non deve incastrare l'operatore dentro il modo.
+* **OFF esce sempre**, senza condizioni: azzera i comandi e restituisce le uscite.
+  È la via d'uscita sicura e non va mai bloccata.
+* **La chiusura non ha consensi**: `CmdCloseSB` / `CmdCloseBB` tolgono il comando e basta.
+* **L'apertura** vuole modo attivo, `EnableOk` e `BothClosedOk`: è lì che vive la regola
+  "un solo freno aperto" e la richiusura manuale obbligatoria.
+* Se cade la chiave di **Service Mode** il modo cade e le uscite tornano alla gestione
+  winda. Se cade il resto di `EnableOk` (Notaus, livello, movimento, coppia) i comandi
+  di apertura vanno via ma il modo resta: i freni sono comandati chiusi.
 
 ## Requisiti coperti
 
 | Richiesta | Dove |
 |---|---|
-| Service Mode | `in_ServiceMode` in `EnableOk` (permanente) |
+| Service Mode | `in_ServiceMode` in `EnableOk`, e il modo cade con la chiave |
 | Livello utente 2 | `in_UserLevel >= MinUserLevel` |
 | Notaus sempre attivo | `in_NAok` in `EnableOk` (permanente) |
 | Winda ferma / azionamento scarico | `in_Rpm` e `in_Torque` in `EnableOk` (permanente) |
-| Un solo freno aperto | `BothClosedOk` in `enOpenSB` / `enOpenBB` |
+| Un solo freno aperto | `BothClosedOk` in `enOpenSB` / `enOpenBB`, e i comandi si escludono |
 | Richiusura manuale obbligatoria | `BothClosedOk` arriva solo 5 s dopo la caduta dei feedback |
 | Status verso il PILZ | `ManualTestBremse` |
 | Descrizione del rischio | `doc/Betriebsanleitung_Bremsentest.md` |
@@ -89,29 +108,31 @@ scrive** su `IO_Hauptinverter`: nessuna coppia viene imposta. Il controllo vero 
 Il Bremstest si aggiunge come secondo blocco sopra questa base
 (la versione completa resta nella storia git, commit `f4e84e3`).
 
-## Integrazione
+## Da completare
 
-1. Richiamare il PRG nel task **dopo** la normale gestione winda.
-2. Tre righe `(*TODO*)` in fondo: uscite reali di apertura SB/BB e variabile di scambio
-   verso il PILZ per `ManualTestBremse`.
-3. Se nel progetto esistono i feedback "chiuso" (`SBzu` / `BBzu`), usarli al posto della
-   negazione di "aperto": con un sensore rotto i due segnali non sono coerenti.
+1. Uscite reali di apertura SB/BB nella sezione 8 (le due righe `(*TODO*)` dentro
+   `IF ManualTestBremse THEN`) e variabile di scambio verso il PILZ.
+2. Richiamo nel task **dopo** la gestione winda.
+3. Se esistono i feedback "chiuso" (`SBzu` / `BBzu`), usarli al posto della negazione di
+   "aperto": con un sensore rotto i due segnali non sono coerenti.
 4. Tarare `RpmStandstill` e `TorqueFreeLimit` sui valori reali dell'inverter.
 
 ## Visu
 
 Blocco già presente sulla pagina, da mantenere:
 `((IOPilzWinde.K_NAok_VZ) AND (g_IO.ServiceMode) AND (CurrentUserLevel>=2)) = FALSE`.
-In più sui pulsanti: `NOT enTestOn`, `NOT enTestOff`, `NOT enOpenSB`, `NOT enOpenBB`,
-`NOT enClose`. Avviso fisso se `ManualCloseRequired`, `FaultBothOpen`, `WarnNoFeedback`.
+In più sui pulsanti: `NOT enTestOn`, `NOT enTestOff`, `NOT enOpenSB`, `NOT enCloseSB`,
+`NOT enOpenBB`, `NOT enCloseBB`. Avvisi: `ManualCloseRequired`, `FaultBothOpen`,
+`WarnNoFeedback`, `WarnOpenExtern`.
 
 ## Prove in impianto
 
-* Entrambi chiusi ⇒ attiva il modo, apri BB, dopo 5 s `BrakeOpenOk`; `enOpenSB` resta FALSE.
-* Premi "chiudi": `enOpenSB` torna TRUE solo 5 s dopo la caduta di `g_IO.BBoffen`.
-* Togli Service Mode / Notaus, o muovi la winda con un freno aperto ⇒ comando via subito.
-* Entra nel modo con un freno già aperto ⇒ nessuna apertura ammessa,
-  `ManualCloseRequired` e `WarnOpenExtern` accesi, uscita dal modo comunque possibile.
+* SB aperta, BB chiusa ⇒ premi ON: la SB deve chiudersi. Se non si muove niente,
+  le uscite della sezione 8 non sono collegate oppure il PRG non è chiamato dopo la
+  gestione winda.
+* Dopo la caduta di `g_IO.SBoffen` contare 5 s: solo allora `enOpenSB` / `enOpenBB`.
+* Apri BB, poi premi ON/OFF: con OFF il modo cade sempre e la BB si chiude.
+* Togli Service Mode / Notaus, o muovi la winda con un freno aperto ⇒ comandi via subito.
 * `brakeOpenFb <> 0` con la winda ferma e i freni visibilmente chiusi ⇒ il feedback
   `g_IO.SBoffen` / `g_IO.BBoffen` non è coerente: controllare cablaggio e polarità
   prima di andare avanti, tutto l'interblocco si appoggia su quei due bit.
